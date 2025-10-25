@@ -13,6 +13,7 @@ from linebot.v3.messaging import (
     MessagingApi,
     Configuration,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
 )
 
@@ -69,14 +70,25 @@ def on_message_event(event: MessageEvent):
             )
             return
 
+        # ส่งข้อความแจ้งเตือน "กำลังประมวลผล" ก่อน
+        processing_message = TextMessage(text="⏳ กำลังประมวลผลคำถามของคุณ กรุณารอสักครู่...")
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[processing_message]
+            )
+        )
+
         # ถ้าไม่ใช่ quick reply, ไปถาม RAG ปกติ
         reply_message = generate_reply_message(event)
         if not reply_message:
             return None
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
+        # ส่งคำตอบจริงด้วย push message
+        user_id = event.source.user_id if event.source and hasattr(event.source, 'user_id') else "unknown"
+        line_bot_api.push_message(
+            PushMessageRequest(
+                to=user_id,
                 messages=[reply_message]
             )
         )

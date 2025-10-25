@@ -432,7 +432,7 @@ def check_and_update_question_limit(user_id: str, max_questions: int = 3):
             update_data = {
                 "user_id": user_id,
                 "daily_question_count": 1,
-                "last_question_date": current_date,
+                "last_question_date": current_date.isoformat(),
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow()
             }
@@ -476,7 +476,7 @@ def check_and_update_question_limit(user_id: str, max_questions: int = 3):
         new_count = daily_question_count + 1
         update_data = {
             "daily_question_count": new_count,
-            "last_question_date": current_date,
+            "last_question_date": current_date.isoformat(),
             "updated_at": datetime.utcnow()
         }
         
@@ -1351,7 +1351,7 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
         # เพิ่มข้อมูลจำนวนคำถามที่เหลือ
         remaining_questions = 3 - current_count
         if remaining_questions > 0:
-            answer += f"\n\n💫 คุณสามารถถามคำถามได้อีก {remaining_questions} คำถามในวันนี้"
+            answer += f"\n\nคุณสามารถถามคำถามได้อีก {remaining_questions} คำ..."
         elif remaining_questions == 0:
             answer += f"\n\n⚠️ นี่เป็นคำถามสุดท้ายของคุณในวันนี้"
         
