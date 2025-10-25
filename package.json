@@ -1,0 +1,21 @@
+{
+  "name": "astrobot",
+  "version": "1.0.0",
+  "description": "Astrology LINE bot with LangChain RAG backend",
+  "main": "index.js",
+ "scripts": {
+  "start": "node app/index.js",
+  "dev": "nodemon app/index.js" 
+  },
+
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@line/bot-sdk": "^7.5.0",
+    "axios": "^1.8.4",
+    "dotenv": "^16.4.7",
+    "express": "^4.18.2",
+    "luxon": "^3.6.1",
+    "nodemon": "^3.1.9"
+  }
+}
