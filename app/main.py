@@ -17,10 +17,10 @@ from linebot.v3.messaging import (
     TextMessage,
 )
 
-from app.response_message import generate_reply_message
-from app.retrieval_utils import ask_question_to_rag, store_user_response, store_user_question, check_and_update_question_limit
-from app.quick_reply import handle_quick_reply
-from app.content_filter import check_content_safety
+from .response_message import generate_reply_message
+from .retrieval_utils import ask_question_to_rag, store_user_response, store_user_question, check_and_update_question_limit
+from .quick_reply import handle_quick_reply
+from .content_filter import check_content_safety
 
 app = FastAPI()
 

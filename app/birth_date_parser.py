@@ -839,7 +839,7 @@ def generate_birth_chart_prediction(message: str, user_id: str = "unknown") -> s
     
     # ใช้ RAG system เพื่อสร้างคำทำนาย
     try:
-        from app.retrieval_utils import ask_question_to_rag
+        from .retrieval_utils import ask_question_to_rag
         prediction = ask_question_to_rag(enhanced_query, user_id)
         
         # เพิ่มข้อมูล Ascendant ในคำตอบถ้ามี

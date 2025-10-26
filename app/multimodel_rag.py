@@ -42,7 +42,7 @@ load_dotenv(dotenv_path)
 PDF_PATH = "data/attention.pdf"
 MONGO_URL = os.getenv("MONGO_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SUMMARY_DB_NAME = "astrobot_summary"  # สำหรับเก็บข้อมูลที่ summary และ embedding แล้ว
+SUMMARY_DB_NAME = "astrobot_summary"  # สำหรับเก็บข้อมูลที่ summary และ summary embedding แล้ว
 ORIGINAL_DB_NAME = "astrobot_original"  # สำหรับเก็บไฟล์ต้นฉบับที่ extract แล้ว
 
 # ✅ ตัวแปรระบบ - Collection Names
@@ -436,7 +436,7 @@ def store_processed_data_in_mongodb(chunks, collection_name):
         
         # ใช้ SUMMARY_DB_NAME สำหรับข้อมูลที่ประมวลผลแล้ว
         db_name = SUMMARY_DB_NAME
-        print(f"📊 ใช้ Database: {db_name} (Processed - มี embeddings/summary)")
+        print(f"📊 ใช้ Database: {db_name} (Processed - มี summary embeddings/summary)")
         
         db = client[db_name]
         collection = db[collection_name]
@@ -444,15 +444,20 @@ def store_processed_data_in_mongodb(chunks, collection_name):
         # ลบข้อมูลเก่า
         collection.delete_many({})
         
-        # บันทึกข้อมูลที่ประมวลผลแล้ว (มี embeddings และ summary)
+        # บันทึกข้อมูลที่ประมวลผลแล้ว (มี summary embeddings และ summary)
         for i, chunk in enumerate(chunks):
             print(f"📝 กำลังประมวลผล chunk {i+1}/{len(chunks)}...")
             
             # สร้างสำเนาของ chunk และเพิ่มข้อมูลที่ประมวลผลแล้ว
             processed_chunk = chunk.copy()
             processed_chunk["created_at"] = datetime.now()
-            processed_chunk["embeddings"] = create_embeddings(chunk["text"])
-            processed_chunk["summary"] = summarize_with_openai(chunk["text"], chunk["type"])
+            
+            # สร้าง summary ก่อน
+            summary_text = summarize_with_openai(chunk["text"], chunk["type"])
+            processed_chunk["summary"] = summary_text
+            
+            # สร้าง embeddings จาก summary แทน text ต้นฉบับ
+            processed_chunk["embeddings"] = create_embeddings(summary_text)
             
             collection.insert_one(processed_chunk)
             
@@ -526,8 +531,13 @@ def store_processed_to_json(chunks, collection_name):
             # สร้างสำเนาของ chunk และเพิ่มข้อมูลที่ประมวลผลแล้ว
             processed_chunk = chunk.copy()
             processed_chunk["created_at"] = datetime.now().isoformat()
-            processed_chunk["embeddings"] = create_embeddings(chunk["text"])
-            processed_chunk["summary"] = summarize_with_openai(chunk["text"], chunk["type"])
+            
+            # สร้าง summary ก่อน
+            summary_text = summarize_with_openai(chunk["text"], chunk["type"])
+            processed_chunk["summary"] = summary_text
+            
+            # สร้าง embeddings จาก summary แทน text ต้นฉบับ
+            processed_chunk["embeddings"] = create_embeddings(summary_text)
             processed_chunks.append(processed_chunk)
             
             # ตรวจสอบ memory ทุก 3 chunks
@@ -625,7 +635,7 @@ def main():
         store_original_data_in_mongodb(original_image_chunks, ORIGINAL_IMAGE_COLLECTION)
         store_original_data_in_mongodb(original_table_chunks, ORIGINAL_TABLE_COLLECTION)
         
-        # เก็บข้อมูลที่ประมวลผลแล้ว (มี embedding และ summary) ใน SUMMARY_DB_NAME
+        # เก็บข้อมูลที่ประมวลผลแล้ว (มี summary embedding และ summary) ใน SUMMARY_DB_NAME
         print("\n📊 เก็บข้อมูลที่ประมวลผลแล้วใน SUMMARY_DB_NAME...")
         store_processed_data_in_mongodb(text_chunks, PROCESSED_TEXT_COLLECTION)
         store_processed_data_in_mongodb(image_chunks, PROCESSED_IMAGE_COLLECTION)

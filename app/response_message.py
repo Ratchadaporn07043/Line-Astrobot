@@ -8,11 +8,11 @@ import os
 import re
 
 # ใช้ฟังก์ชัน Retrieval จาก utils
-from app.retrieval_utils import ask_question_to_rag, store_user_response, store_user_question, check_and_update_question_limit
+from .retrieval_utils import ask_question_to_rag, store_user_response, store_user_question, check_and_update_question_limit
 # ใช้ฟังก์ชัน Birth Date Parser
-from app.birth_date_parser import extract_birth_date_from_message, generate_birth_chart_prediction
+from .birth_date_parser import extract_birth_date_from_message, generate_birth_chart_prediction
 # ใช้ฟังก์ชัน Content Filter
-from app.content_filter import check_content_safety
+from .content_filter import check_content_safety
 
 load_dotenv()
 
@@ -99,7 +99,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                 # สร้างข้อมูลดวงชะตาเพื่อแสดงข้อมูล Ascendant (ถ้ามีเวลาเกิด)
                 ascendant_info = ""
                 try:
-                    from app.birth_date_parser import BirthDateParser
+                    from .birth_date_parser import BirthDateParser
                     parser = BirthDateParser()
                     birth_info = parser.extract_birth_info(user_message)
                     if birth_info and birth_info.get('time'):
@@ -127,7 +127,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                 # ตอบคำถามโหราศาสตร์ทันที
                 try:
                     logger.info(f"กำลังตอบคำถามโหราศาสตร์สำหรับ: {user_message}")
-                    from app.retrieval_utils import ask_question_to_rag
+                    from .retrieval_utils import ask_question_to_rag
                     astrology_answer = ask_question_to_rag(user_message, user_id)
                     logger.info(f"ได้รับคำตอบโหราศาสตร์ (ความยาว: {len(astrology_answer)} ตัวอักษร)")
                     

@@ -6,7 +6,7 @@ from datetime import datetime
 from linebot.v3.messaging.models import (
     TextMessage, QuickReply, QuickReplyItem, MessageAction
 )
-from app.retrieval_utils import store_user_response, store_user_question
+from .retrieval_utils import store_user_response, store_user_question
 
 # ตั้งค่า logger
 logger = logging.getLogger(__name__)
@@ -94,7 +94,7 @@ def handle_quick_reply(event):
         elif userSession.get(user_id, {}).get("mode") == "aspect" and '/' in msg:
             try:
                 # ใช้ BirthDateParser เพื่อแยกข้อมูลวันเกิดและเวลาเกิด
-                from app.birth_date_parser import BirthDateParser
+                from .birth_date_parser import BirthDateParser
                 parser = BirthDateParser()
                 birth_info = parser.extract_birth_info(msg)
                 
@@ -121,7 +121,7 @@ def handle_quick_reply(event):
                     ai_question = f"ทำนายดวงเฉพาะด้านสำหรับคนที่เกิดวันที่ {birth_info['date']} (ราศี{zodiac})"
                 
                 # ใช้ AI สร้างคำตอบ
-                from app.retrieval_utils import ask_question_to_rag
+                from .retrieval_utils import ask_question_to_rag
                 response_text = ask_question_to_rag(ai_question, user_id)
                 
                 # บันทึกคำถามใน user_profiles
@@ -151,7 +151,7 @@ def handle_quick_reply(event):
                 ai_question = f"เคล็ดลับเสริมดวงและสีมงคลสำหรับคนที่เกิดวัน{d}"
                 
                 # ใช้ AI สร้างคำตอบ
-                from app.retrieval_utils import ask_question_to_rag
+                from .retrieval_utils import ask_question_to_rag
                 response_text = ask_question_to_rag(ai_question, user_id)
                 
                 # บันทึกคำถามใน user_profiles
@@ -182,7 +182,7 @@ def handle_quick_reply(event):
             ai_question = f"ดูดวงรายเดือนสำหรับราศี{zodiac} ครอบคลุมการงาน การเงิน สุขภาพ และความรัก"
             
             # ใช้ AI สร้างคำตอบ
-            from app.retrieval_utils import ask_question_to_rag
+            from .retrieval_utils import ask_question_to_rag
             response_text = ask_question_to_rag(ai_question, user_id)
             
             # บันทึกคำถามใน user_profiles
@@ -230,7 +230,7 @@ def handle_quick_reply(event):
                     ai_question = f"ดูดวงพื้นฐานสำหรับคนที่เกิดวัน{day} ปีนักษัตร{zodiac}"
                 
                 # ใช้ AI สร้างคำตอบ
-                from app.retrieval_utils import ask_question_to_rag
+                from .retrieval_utils import ask_question_to_rag
                 response_text = ask_question_to_rag(ai_question, user_id)
                 
                 # บันทึกคำถามใน user_profiles

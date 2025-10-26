@@ -10,7 +10,7 @@ MONGO_URL = "mongodb+srv://your-username:your-password@cluster0.xxxxx.mongodb.ne
 OPENAI_API_KEY = "your-openai-api-key-here"
 
 # Database Configuration
-SUMMARY_DB_NAME = "astrobot_summary"  # สำหรับเก็บข้อมูลที่ summary และ embedding แล้ว
+SUMMARY_DB_NAME = "astrobot_summary"  # สำหรับเก็บข้อมูลที่ summary และ summary embedding แล้ว
 ORIGINAL_DB_NAME = "astrobot_original"  # สำหรับเก็บไฟล์ต้นฉบับที่ extract แล้ว
 
 # Collection Names
