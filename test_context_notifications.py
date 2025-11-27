@@ -10,7 +10,7 @@ from datetime import datetime
 # เพิ่ม path สำหรับ import modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from app.retrieval_utils import ask_question_to_rag, enhance_question_context, get_user_context
+from app.retrieval_utils import ask_question_to_rag, get_user_context
 
 def test_context_notifications():
     """ทดสอบการแจ้งเตือนเมื่อไม่มีข้อมูลบริบท"""
@@ -65,40 +65,14 @@ def test_context_notifications():
     except Exception as e:
         print(f"❌ เกิดข้อผิดพลาด: {e}\n")
 
+# หมายเหตุ: ฟังก์ชัน enhance_question_context ถูกลบแล้ว ใช้ refine_follow_up_question_with_llm แทน
+# การทดสอบนี้ถูกปิดการใช้งานชั่วคราว
 def test_enhance_question_context():
-    """ทดสอบฟังก์ชัน enhance_question_context"""
+    """ทดสอบฟังก์ชัน refine_follow_up_question_with_llm (เดิมคือ enhance_question_context)"""
     
-    print("=== ทดสอบฟังก์ชัน enhance_question_context ===\n")
-    
-    # ทดสอบ 1: คำถามต่อเนื่องโดยไม่มีบริบท
-    print("1. ทดสอบคำถามต่อเนื่องโดยไม่มีบริบท:")
-    question = "ราศีนี้มีลักษณะนิสัยยังไง"
-    user_context = None
-    
-    result = enhance_question_context(question, user_context)
-    print(f"คำถามเดิม: {question}")
-    print(f"ผลลัพธ์: {result}")
-    print("✅ ระบบแจ้งเตือนผู้ใช้ให้ระบุวันเกิดก่อน\n")
-    
-    # ทดสอบ 2: คำถามต่อเนื่องที่มีบริบทบางส่วน
-    print("2. ทดสอบคำถามต่อเนื่องที่มีบริบทบางส่วน:")
-    question = "ราศีนี้มีลักษณะนิสัยยังไง"
-    user_context = {"birth_date": "09/02/2004", "zodiac_sign": None}
-    
-    result = enhance_question_context(question, user_context)
-    print(f"คำถามเดิม: {question}")
-    print(f"ผลลัพธ์: {result}")
-    print("✅ ระบบแจ้งเตือนผู้ใช้ให้ระบุวันเกิดก่อน\n")
-    
-    # ทดสอบ 3: คำถามต่อเนื่องที่มีบริบทครบถ้วน
-    print("3. ทดสอบคำถามต่อเนื่องที่มีบริบทครบถ้วน:")
-    question = "ราศีนี้มีลักษณะนิสัยยังไง"
-    user_context = {"birth_date": "09/02/2004", "zodiac_sign": "กุมภ์"}
-    
-    result = enhance_question_context(question, user_context)
-    print(f"คำถามเดิม: {question}")
-    print(f"ผลลัพธ์: {result}")
-    print("✅ ระบบปรับปรุงคำถามให้ชัดเจน\n")
+    print("=== ทดสอบฟังก์ชัน refine_follow_up_question_with_llm ===\n")
+    print("หมายเหตุ: ฟังก์ชันนี้ใช้ LLM ในการปรับคำถาม ต้องมี OpenAI API key")
+    print("การทดสอบนี้ถูกปิดการใช้งานชั่วคราว\n")
 
 def test_get_user_context():
     """ทดสอบฟังก์ชัน get_user_context"""

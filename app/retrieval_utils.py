@@ -525,152 +525,6 @@ def analyze_question_intent(question: str) -> dict:
     return intent
 
 # ฟังก์ชันปรับปรุงคำถามให้ชัดเจนขึ้นสำหรับคำถามต่อเนื่อง
-def enhance_question_context(question: str, user_context: dict = None) -> str:
-    """
-    ปรับปรุงคำถามให้ชัดเจนขึ้นสำหรับคำถามต่อเนื่อง โดยใช้ข้อมูลบริบท
-    และข้อมูลจาก collection responses รวมถึงข้อมูลการสนทนาก่อนหน้า
-    
-    Args:
-        question (str): คำถามเดิม
-        user_context (dict): ข้อมูลบริบทของผู้ใช้
-        
-    Returns:
-        str: คำถามที่ปรับปรุงแล้ว
-    """
-    question_lower = question.lower()
-    
-    # ตรวจสอบคำถามต่อเนื่องที่อ้างอิงถึงราศี
-    if any(word in question_lower for word in ["ราศีนี้", "ราศีของฉัน", "ราศีของผม", "ราศีของเรา", "คนราศีนี้", "ราศี", "ดวงชะตา", "นิสัย", "ลักษณะ", "ดาวเคราะห์", "บ้าน", "แอสเปค", "โหราศาสตร์", "ดวง", "สีมงคล", "สัย", "เป็นไง", "เป็นอย่างไร", "ยังไง", "อย่างไร", "ความรัก", "อาชีพ", "การงาน", "สุขภาพ", "การเงิน", "เหมาะ", "ดี", "เป็น", "เป็นคน", "คน", "ดวง", "โหราศาสตร์", "ดาวเคราะห์", "บ้าน", "แอสเปค", "ของคน", "ของ", "เป็นยังไง", "เป็นอย่างไร", "ยังไง", "อย่างไร", "เป็นไง"]):
-        # print(f"พบคำถามต่อเนื่อง: {question}")
-        
-        # ใช้ข้อมูลราศีจากบริบทก่อน
-        zodiac = None
-        if user_context and user_context.get("zodiac_sign"):
-            zodiac = user_context["zodiac_sign"]
-            # print(f"ใช้ราศีจากบริบท: {zodiac}")
-        elif user_context and user_context.get("birth_date"):
-            # ถ้าไม่มีราศีในบริบท แต่มีวันเกิด ให้คำนวณใหม่
-            try:
-                from datetime import datetime
-                birth_date = datetime.strptime(user_context["birth_date"], "%d/%m/%Y")
-                day, month = birth_date.day, birth_date.month
-                zodiac = calculate_zodiac_from_date(day, month)
-                # print(f"คำนวณราศีจากวันเกิด: {zodiac}")
-            except:
-                pass
-        
-        # ตรวจสอบข้อมูลราศีจาก recent_conversations ถ้าไม่มีใน user_context
-        if not zodiac and user_context and user_context.get("recent_conversations"):
-            for conv in user_context["recent_conversations"]:
-                context_data = conv.get("context_data", {})
-                if context_data.get("zodiac_sign"):
-                    zodiac = context_data["zodiac_sign"]
-                    # print(f"ใช้ราศีจาก recent_conversations: {zodiac}")
-                    break
-        
-        # ตรวจสอบข้อมูลราศีจาก last_conversation ถ้าไม่มีใน user_context
-        if not zodiac and user_context and user_context.get("last_conversation"):
-            last_conv = user_context["last_conversation"]
-            # วิเคราะห์คำตอบก่อนหน้าเพื่อหาข้อมูลราศี
-            if last_conv.get("answer"):
-                answer_text = last_conv["answer"]
-                # ค้นหาข้อมูลราศีในคำตอบก่อนหน้า
-                zodiac_keywords = ["ราศีเมษ", "ราศีพฤษภ", "ราศีมิถุน", "ราศีกรกฎ", "ราศีสิงห์", "ราศีกันย์", 
-                                 "ราศีตุล", "ราศีพิจิก", "ราศีธนู", "ราศีมังกร", "ราศีกุมภ์", "ราศีมีน",
-                                 "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo", 
-                                 "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"]
-                
-                for keyword in zodiac_keywords:
-                    if keyword in answer_text:
-                        # แปลงเป็นชื่อราศีไทย
-                        if keyword in ["ราศีเมษ", "Aries"]:
-                            zodiac = "เมษ"
-                        elif keyword in ["ราศีพฤษภ", "Taurus"]:
-                            zodiac = "พฤษภ"
-                        elif keyword in ["ราศีมิถุน", "Gemini"]:
-                            zodiac = "มิถุน"
-                        elif keyword in ["ราศีกรกฎ", "Cancer"]:
-                            zodiac = "กรกฎ"
-                        elif keyword in ["ราศีสิงห์", "Leo"]:
-                            zodiac = "สิงห์"
-                        elif keyword in ["ราศีกันย์", "Virgo"]:
-                            zodiac = "กันย์"
-                        elif keyword in ["ราศีตุล", "Libra"]:
-                            zodiac = "ตุล"
-                        elif keyword in ["ราศีพิจิก", "Scorpio"]:
-                            zodiac = "พิจิก"
-                        elif keyword in ["ราศีธนู", "Sagittarius"]:
-                            zodiac = "ธนู"
-                        elif keyword in ["ราศีมังกร", "Capricorn"]:
-                            zodiac = "มังกร"
-                        elif keyword in ["ราศีกุมภ์", "Aquarius"]:
-                            zodiac = "กุมภ์"
-                        elif keyword in ["ราศีมีน", "Pisces"]:
-                            zodiac = "มีน"
-                        break
-        
-        if zodiac:
-            # แทนที่คำถามให้ชัดเจน
-            enhanced = question.replace("ราศีนี้", f"ราศี{zodiac}").replace("ราศีของฉัน", f"ราศี{zodiac}").replace("ราศีของผม", f"ราศี{zodiac}").replace("ราศีของเรา", f"ราศี{zodiac}").replace("คนราศีนี้", f"คนราศี{zodiac}")
-            
-            # เพิ่มการจัดการคำถามทั่วไป
-            if "คนราศีนี้" in question_lower and zodiac not in question:
-                enhanced = f"คนราศี{zodiac} {question}"
-            elif "ราศี" in question_lower and zodiac not in question:
-                enhanced = f"ราศี{zodiac} {question}"
-            elif "ดวงชะตา" in question_lower and zodiac not in question:
-                enhanced = f"ดวงชะตาราศี{zodiac} {question}"
-            elif "นิสัย" in question_lower and zodiac not in question:
-                enhanced = f"ลักษณะนิสัยราศี{zodiac} {question}"
-            elif "ลักษณะ" in question_lower and zodiac not in question:
-                enhanced = f"ลักษณะนิสัยราศี{zodiac} {question}"
-            elif "สัย" in question_lower and zodiac not in question:
-                enhanced = f"ลักษณะนิสัยราศี{zodiac} {question}"
-            elif "ดาวเคราะห์" in question_lower and zodiac not in question:
-                enhanced = f"ดาวเคราะห์ราศี{zodiac} {question}"
-            elif "บ้าน" in question_lower and zodiac not in question:
-                enhanced = f"บ้านราศี{zodiac} {question}"
-            elif "แอสเปค" in question_lower and zodiac not in question:
-                enhanced = f"แอสเปคราศี{zodiac} {question}"
-            elif "โหราศาสตร์" in question_lower and zodiac not in question:
-                enhanced = f"โหราศาสตร์ราศี{zodiac} {question}"
-            elif "ดวง" in question_lower and zodiac not in question:
-                enhanced = f"ดวงราศี{zodiac} {question}"
-            elif "สีมงคล" in question_lower and zodiac not in question:
-                enhanced = f"สีมงคลราศี{zodiac} {question}"
-            elif "ความรัก" in question_lower and zodiac not in question:
-                enhanced = f"ความรักราศี{zodiac} {question}"
-            elif "อาชีพ" in question_lower and zodiac not in question:
-                enhanced = f"อาชีพราศี{zodiac} {question}"
-            elif "การงาน" in question_lower and zodiac not in question:
-                enhanced = f"การงานราศี{zodiac} {question}"
-            elif "สุขภาพ" in question_lower and zodiac not in question:
-                enhanced = f"สุขภาพราศี{zodiac} {question}"
-            elif "การเงิน" in question_lower and zodiac not in question:
-                enhanced = f"การเงินราศี{zodiac} {question}"
-            elif "เหมาะ" in question_lower and zodiac not in question:
-                enhanced = f"ราศี{zodiac} {question}"
-            elif "ดี" in question_lower and zodiac not in question:
-                enhanced = f"ราศี{zodiac} {question}"
-            elif "เป็น" in question_lower and zodiac not in question:
-                enhanced = f"ราศี{zodiac} {question}"
-            elif "เป็นคน" in question_lower and zodiac not in question:
-                enhanced = f"ราศี{zodiac} {question}"
-            elif "คน" in question_lower and zodiac not in question and "ราศี" in question_lower:
-                enhanced = f"ราศี{zodiac} {question}"
-            elif "ของคน" in question_lower and zodiac not in question:
-                enhanced = f"ราศี{zodiac} {question}"
-            elif "ของ" in question_lower and zodiac not in question and "ราศี" in question_lower:
-                enhanced = f"ราศี{zodiac} {question}"
-            
-            # print(f"ใช้ราศี: {zodiac}")
-            # print(f"แปลงคำถาม: {question} → {enhanced}")
-            return enhanced
-        else:
-            # ไม่มีข้อมูลราศี ก็ส่งคำถามเดิมกลับไปเพื่อให้ระบบตอบแบบทั่วไป
-            return question
-    
-    return question
 
 # ฟังก์ชันสร้างข้อมูลบริบทการสนทนาก่อนหน้า
 def get_conversation_context(user_context: dict = None) -> str:
@@ -710,32 +564,6 @@ def get_conversation_context(user_context: dict = None) -> str:
         return "ไม่มีข้อมูลการสนทนาก่อนหน้า"
 
 # ฟังก์ชันสร้างคำถามต่อเนื่องอัตโนมัติ
-def generate_follow_up_questions(context_data: dict = None) -> list:
-    """
-    สร้างคำถามต่อเนื่องอัตโนมัติตามบริบทของผู้ใช้
-    
-    Args:
-        context_data (dict): ข้อมูลบริบทของผู้ใช้หรือข้อมูลดวงชะตา
-        
-    Returns:
-        list: รายการคำถามต่อเนื่อง
-    """
-    if not context_data or not context_data.get("zodiac_sign"):
-        return []
-    
-    zodiac = context_data.get("zodiac_sign")
-    follow_up_questions = [
-        f"นิสัยคนราศี{zodiac}เป็นไง",
-        f"อยากทราบเรื่องความรักของราศี{zodiac}",
-        f"สีมงคลของราศี{zodiac}มีอะไรบ้าง",
-        f"อาชีพที่เหมาะกับราศี{zodiac}",
-        f"จุดแข็งและจุดอ่อนของราศี{zodiac}",
-        f"วิธีดูแลสุขภาพสำหรับราศี{zodiac}",
-        f"ความสัมพันธ์กับราศีอื่นๆ ของราศี{zodiac}",
-        f"การเงินและการลงทุนสำหรับราศี{zodiac}"
-    ]
-    
-    return follow_up_questions
 
 def calculate_zodiac_from_date(day: int, month: int) -> str:
     """
@@ -984,6 +812,90 @@ def check_follow_up_question_with_semantic_similarity(
         return False, 0.0
 
 # ✔️ ตรวจสอบคำถามต่อเนื่องด้วย LLM (OpenAI GPT)
+def refine_follow_up_question_with_llm(question: str, user_context: dict = None) -> str:
+    """
+    ปรับคำถามล่าสุดกับคำถามก่อนหน้าเข้าด้วยกันโดยใช้ LLM (OpenAI GPT)
+    
+    ใช้ LLM เพื่อปรับปรุงคำถามปัจจุบันให้ชัดเจนขึ้นโดยใช้บริบทจากคำถามก่อนหน้าและคำตอบก่อนหน้า
+    โดยส่งข้อมูล [last_question, last_response, Current question] ไปให้ LLM ปรับคำถาม
+    
+    Args:
+        question (str): คำถามปัจจุบัน
+        user_context (dict): ข้อมูลบริบทของผู้ใช้
+        
+    Returns:
+        str: คำถามที่ปรับปรุงแล้ว
+    """
+    try:
+        # ถ้าไม่มีบริบทการสนทนา ให้ส่งคำถามเดิมกลับไป
+        if not user_context or not user_context.get("last_question"):
+            return question
+        
+        # ถ้ามีข้อมูลวันเกิดในคำถาม ให้ส่งคำถามเดิมกลับไป (ไม่ต้องปรับ)
+        has_birth_date_in_question = any(pattern in question for pattern in [
+            "/", "-", ".", "เดือน", "ปี", "วันเกิด", "เกิด", "มกราคม", "กุมภาพันธ์", "มีนาคม", 
+            "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", 
+            "ตุลาคม", "พฤศจิกายน", "ธันวาคม"
+        ])
+        
+        if has_birth_date_in_question:
+            return question
+        
+        # ใช้ LLM เพื่อปรับคำถาม
+        from openai import OpenAI
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key or openai_key == "your-openai-api-key-here":
+            logger.warning("OpenAI API key not configured, returning original question")
+            return question
+        
+        client = OpenAI(api_key=openai_key)
+        
+        # ดึงข้อมูลบริบทก่อนหน้า
+        last_question = user_context.get("last_question", "")
+        last_response = user_context.get("last_response", "")
+        user_zodiac = user_context.get("zodiac_sign", "")
+        
+        # สร้าง prompt สำหรับปรับคำถาม
+        prompt = f"""คุณเป็นผู้เชี่ยวชาญในการปรับปรุงคำถามให้ชัดเจนขึ้นโดยใช้บริบทการสนทนาก่อนหน้า
+
+คำถามก่อนหน้า: "{last_question}"
+คำตอบก่อนหน้า: "{last_response[:500]}..."
+คำถามปัจจุบัน: "{question}"
+ราศีของผู้ใช้: {user_zodiac if user_zodiac else "ไม่ระบุ"}
+
+กรุณาปรับปรุงคำถามปัจจุบันให้ชัดเจนขึ้นโดย:
+1. ถ้าคำถามปัจจุบันอ้างอิงถึง "ราศีนี้", "ราศีของฉัน", "คนราศีนี้" ให้ระบุชื่อราศีชัดเจน
+2. ถ้าคำถามปัจจุบันเป็นคำถามสั้นๆ ที่อ้างอิงถึงข้อมูลก่อนหน้า ให้ทำให้ชัดเจนขึ้น
+3. ถ้าคำถามปัจจุบันถามเกี่ยวกับข้อมูลที่เกี่ยวข้องกับคำตอบก่อนหน้า ให้เชื่อมโยงให้ชัดเจน
+4. รักษาความหมายเดิมของคำถามไว้
+5. ใช้ภาษาธรรมชาติและเข้าใจง่าย
+
+ตอบแค่คำถามที่ปรับปรุงแล้วเท่านั้น ไม่ต้องอธิบายเพิ่มเติม:"""
+        
+        # ใช้ชื่อโมเดลจาก ENV ถ้าไม่ระบุจะใช้ gpt-4o-mini
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        response = client.chat.completions.create(
+            model=openai_model,
+            messages=[
+                {"role": "system", "content": "คุณเป็นผู้เชี่ยวชาญในการปรับปรุงคำถามให้ชัดเจนขึ้นโดยใช้บริบทการสนทนา ตอบแค่คำถามที่ปรับปรุงแล้วเท่านั้น"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=200
+        )
+        
+        refined_question = response.choices[0].message.content.strip()
+        
+        logger.info(
+            f"LLM Question Refinement: '{question[:50]}...' -> '{refined_question[:50]}...'"
+        )
+        
+        return refined_question
+        
+    except Exception as e:
+        logger.warning(f"Error in LLM question refinement: {e}, returning original question")
+        return question
+
 def check_follow_up_question_with_llm(question: str, user_context: dict = None) -> bool:
     """
     ตรวจสอบว่าเป็นคำถามต่อเนื่องหรือไม่โดยใช้ LLM (OpenAI GPT)
@@ -1189,16 +1101,12 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
     # วิเคราะห์เจตนาของคำถาม
     question_intent = analyze_question_intent(question)
     
-    # ปรับปรุงคำถามให้ชัดเจนขึ้นสำหรับคำถามต่อเนื่อง
-    enhanced_question = enhance_question_context(question, user_context)
-    if enhanced_question != question:
-        # ตรวจสอบว่า enhanced_question เป็นข้อความแจ้งเตือนหรือไม่
-        if enhanced_question.startswith("ขออภัยค่ะ ระบบไม่พบข้อมูลราศี"):
-            return enhanced_question
-        # print(f"ปรับปรุงคำถาม: {enhanced_question}")
-        question = enhanced_question
-    
-    # การจัดการคำถามต่อเนื่องถูกจัดการใน enhance_question_context แล้ว
+    # ปรับปรุงคำถามให้ชัดเจนขึ้นสำหรับคำถามต่อเนื่องโดยใช้ LLM
+    if is_follow_up_question and user_context:
+        refined_question = refine_follow_up_question_with_llm(question, user_context)
+        if refined_question and refined_question != question:
+            logger.info(f"Question refined: '{question[:50]}...' -> '{refined_question[:50]}...'")
+            question = refined_question
     
     # ลองค้นหาจาก MongoDB แบบ Manual Search
     retrieved_docs = []
@@ -1659,15 +1567,6 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         
         # ไม่เพิ่ม emoji ใดๆ เพื่อให้คำตอบสะอาดตา
         
-        # สร้างคำถามต่อเนื่องอัตโนมัติสำหรับคำถามใหม่
-        if should_create_chart and astrology_chart:
-            # ถ้าเป็นคำถามใหม่ที่มีข้อมูลวันเกิด ให้สร้างคำถามต่อเนื่อง
-            follow_up_questions = generate_follow_up_questions(astrology_chart)
-            if follow_up_questions:
-                # เพิ่มคำถามต่อเนื่องที่ท้ายคำตอบ
-                answer += f"\n\nหากต้องการทราบข้อมูลเพิ่มเติม สามารถถามได้ เช่น:\n"
-                for i, q in enumerate(follow_up_questions[:3]):  # แสดงแค่ 3 คำถาม
-                    answer += f"• {q}\n"
             
     except Exception as gpt_error:
         # Fallback: ตอบแบบพื้นฐานโดยไม่ใช้ LLM
