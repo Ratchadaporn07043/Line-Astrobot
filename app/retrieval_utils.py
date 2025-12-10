@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from datetime import datetime, timedelta, time as dt_time
 from typing import Tuple
@@ -6,6 +7,10 @@ from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from .birth_date_parser import generate_astrology_reading, generate_detailed_astrology_reading, extract_birth_info_from_message
+
+# แก้ไขปัญหา MPS device - ใช้ CPU แทน
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 # โหลด environment variables
 load_dotenv()
@@ -15,6 +20,183 @@ logger = logging.getLogger(__name__)
 
 # Import database configuration
 from config import SUMMARY_DB_NAME
+# ============================
+# MongoDB Connection Verification
+# ============================
+def verify_mongodb_connection_for_retrieval() -> Tuple[bool, str, dict]:
+    """
+    ตรวจสอบการเชื่อมต่อ MongoDB และเตรียมพร้อมสำหรับ retrieval
+    
+    Returns:
+        tuple: (is_ready, message, connection_info)
+            - is_ready: True ถ้า MongoDB พร้อมใช้งานสำหรับ retrieval
+            - message: ข้อความสรุปผลการตรวจสอบ
+            - connection_info: ข้อมูลการเชื่อมต่อ (client, db, collections)
+    """
+    connection_info = {
+        'client': None,
+        'db': None,
+        'collections': {}
+    }
+    
+    # ตรวจสอบ MONGO_URL
+    mongo_uri = os.getenv("MONGO_URL")
+    if not mongo_uri or mongo_uri == "mongodb+srv://your-username:your-password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority":
+        return False, "MONGO_URL ไม่ได้ตั้งค่าหรือยังเป็นค่า default", connection_info
+    
+    try:
+        # เชื่อมต่อ MongoDB
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000)
+        
+        # ทดสอบการเชื่อมต่อ
+        try:
+            client.server_info()  # จะ raise exception ถ้าเชื่อมต่อไม่ได้
+        except Exception as conn_err:
+            client.close()
+            return False, f"ไม่สามารถเชื่อมต่อ MongoDB ได้: {conn_err}", connection_info
+        
+        # ตรวจสอบว่า database มีอยู่หรือไม่
+        db_names = client.list_database_names()
+        if SUMMARY_DB_NAME not in db_names:
+            client.close()
+            return False, f"Database '{SUMMARY_DB_NAME}' ไม่มีอยู่", connection_info
+        
+        # ตรวจสอบ collections ที่จำเป็น
+        db = client[SUMMARY_DB_NAME]
+        collection_names = db.list_collection_names()
+        
+        required_collections = [
+            "processed_text_chunks",
+            "processed_image_chunks",
+            "processed_table_chunks"
+        ]
+        
+        collections_status = {}
+        total_docs = 0
+        all_collections_exist = True
+        all_collections_have_data = True
+        
+        for collection_name in required_collections:
+            if collection_name not in collection_names:
+                collections_status[collection_name] = {
+                    'exists': False,
+                    'doc_count': 0,
+                    'has_embeddings': False
+                }
+                all_collections_exist = False
+                all_collections_have_data = False
+            else:
+                collection = db[collection_name]
+                doc_count = collection.count_documents({})
+                total_docs += doc_count
+                
+                # ตรวจสอบว่ามี embeddings หรือไม่
+                has_embeddings = False
+                if doc_count > 0:
+                    sample_doc = collection.find_one()
+                    if sample_doc and 'embeddings' in sample_doc:
+                        emb = sample_doc['embeddings']
+                        if isinstance(emb, (list, tuple)) and len(emb) > 0:
+                            has_embeddings = True
+                
+                collections_status[collection_name] = {
+                    'exists': True,
+                    'doc_count': doc_count,
+                    'has_embeddings': has_embeddings
+                }
+                
+                if doc_count == 0:
+                    all_collections_have_data = False
+        
+        connection_info['client'] = client
+        connection_info['db'] = db
+        connection_info['collections'] = collections_status
+        
+        # สรุปผลการตรวจสอบ
+        if not all_collections_exist:
+            message = f"บาง collections ไม่มีอยู่ (ต้องมี: {', '.join(required_collections)})"
+            return False, message, connection_info
+        
+        if total_docs == 0:
+            message = f"Database '{SUMMARY_DB_NAME}' มี collections แต่ไม่มีข้อมูล (0 เอกสาร)"
+            return False, message, connection_info
+        
+        if not all_collections_have_data:
+            empty_collections = [name for name, status in collections_status.items() 
+                               if status['doc_count'] == 0]
+            message = f"บาง collections ว่างเปล่า: {', '.join(empty_collections)}"
+            # ยังคง return True เพราะมีบาง collections มีข้อมูล
+        
+        message = f"✅ MongoDB พร้อมใช้งาน: พบ {total_docs} เอกสารใน {len([s for s in collections_status.values() if s['doc_count'] > 0])} collections"
+        return True, message, connection_info
+        
+    except Exception as e:
+        logger.error(f"Error verifying MongoDB connection: {e}")
+        if connection_info.get('client'):
+            try:
+                connection_info['client'].close()
+            except:
+                pass
+        return False, f"เกิดข้อผิดพลาดในการตรวจสอบ MongoDB: {e}", connection_info
+
+# ============================
+# Answer Source Verification
+# ============================
+def verify_answer_source(answer: str, retrieved_docs: list, question: str) -> bool:
+    """
+    ตรวจสอบว่าคำตอบมาจาก MongoDB เท่านั้นหรือไม่
+    
+    Args:
+        answer: คำตอบที่ได้จาก GPT
+        retrieved_docs: เอกสารที่ retrieve จาก MongoDB
+        question: คำถามที่ถาม
+        
+    Returns:
+        bool: True ถ้าคำตอบน่าจะมาจาก MongoDB, False ถ้าไม่แน่ใจ
+    """
+    if not answer or not retrieved_docs:
+        return False
+    
+    # ตรวจสอบว่าคำตอบมีวลีที่บอกว่าไม่มีข้อมูลในฐานข้อมูล
+    no_data_phrases = [
+        "ไม่พบข้อมูล",
+        "ไม่มีข้อมูล",
+        "ขออภัย",
+        "ไม่สามารถ",
+        "ไม่มีข้อมูลในฐานข้อมูล"
+    ]
+    
+    # ถ้าคำตอบบอกว่าไม่มีข้อมูล แสดงว่าใช้ข้อมูลจาก MongoDB (แต่ไม่มีข้อมูล)
+    if any(phrase in answer for phrase in no_data_phrases):
+        return True
+    
+    # ตรวจสอบว่ามีข้อมูลจาก MongoDB ที่สามารถใช้ตอบคำถามได้
+    if not retrieved_docs or len(retrieved_docs) == 0:
+        return False
+    
+    # ตรวจสอบว่าคำตอบมีเนื้อหาที่เกี่ยวข้องกับข้อมูลที่ retrieve มา
+    # โดยตรวจสอบว่ามีคำสำคัญจาก retrieved_docs ปรากฏในคำตอบ
+    answer_lower = answer.lower()
+    
+    # สร้างชุดคำสำคัญจาก retrieved_docs
+    key_phrases = set()
+    for doc in retrieved_docs[:3]:  # ตรวจสอบเฉพาะ 3 เอกสารแรก
+        if isinstance(doc, dict):
+            content = doc.get('summary', doc.get('text', ''))
+            if content:
+                # แยกคำสำคัญ (คำที่มีความยาวมากกว่า 3 ตัวอักษร)
+                words = content.lower().split()
+                key_phrases.update([w for w in words if len(w) > 3])
+    
+    # ตรวจสอบว่าคำตอบมีคำสำคัญจาก MongoDB หรือไม่
+    if key_phrases:
+        matches = sum(1 for phrase in key_phrases if phrase in answer_lower)
+        # ถ้ามีคำสำคัญจาก MongoDB ปรากฏในคำตอบมากกว่า 10% ถือว่าใช้ข้อมูลจาก MongoDB
+        match_ratio = matches / len(key_phrases) if key_phrases else 0
+        return match_ratio > 0.1
+    
+    return True  # ถ้าไม่มีข้อมูลให้ตรวจสอบ ถือว่าใช้ข้อมูลจาก MongoDB
+
 # ============================
 # Pretty Terminal Reporting
 # ============================
@@ -59,7 +241,7 @@ def print_ragas_terminal_report(
         if total_found > 0:
             print("✔ พบข้อมูลที่เกี่ยวข้อง สามารถใช้ RAG ได้")
         else:
-            print("ไม่พบข้อมูลที่เกี่ยวข้อง -> ใช้ความรู้ทั่วไป (No-RAG)")
+            print("ไม่พบข้อมูลที่เกี่ยวข้อง -> ไม่สามารถใช้ข้อมูลจาก MongoDB ได้")
         print("==== เสร็จสิ้นการค้นหา ===\n")
 
         # แสดงข้อมูลที่ใช้จากฐานข้อมูล
@@ -136,7 +318,7 @@ def store_user_response(
         
         # 🆕 สร้าง embeddings สำหรับ question และ answer เพื่อใช้ใน Semantic Similarity
         try:
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
             question_embedding = model.encode(question, convert_to_numpy=True).tolist()
             answer_embedding = model.encode(answer, convert_to_numpy=True).tolist()
             logger.debug(f"✅ Created embeddings for question and answer (dim: {len(question_embedding)})")
@@ -303,17 +485,22 @@ def get_user_context(user_id: str):
                 "birth_time": user_profile.get("birth_time"),
                 "daily_question_count": user_profile.get("daily_question_count", 0),
                 "last_question_date": user_profile.get("last_question_date"),
-                "updated_at": user_profile.get("updated_at")
+                "updated_at": user_profile.get("updated_at"),
+                "last_question": user_profile.get("last_question"),  # ดึงจาก user_profiles
+                "last_response": user_profile.get("last_response"),  # ดึงจาก user_profiles
+                "last_response_type": user_profile.get("last_response_type")
             })
         
-        # ข้อมูลจาก responses collection
+        # ข้อมูลจาก responses collection (ใช้เป็น fallback หรือข้อมูลเพิ่มเติม)
         if latest_response:
-            context.update({
-                "last_question": latest_response.get("question"),
-                "last_response": latest_response.get("answer"),
-                "last_response_type": latest_response.get("response_type"),
-                "last_response_time": latest_response.get("created_at")
-            })
+            # ถ้ายังไม่มี last_question หรือ last_response ให้ใช้จาก responses
+            if not context.get("last_question") and latest_response.get("question"):
+                context["last_question"] = latest_response.get("question")
+            if not context.get("last_response") and latest_response.get("answer"):
+                context["last_response"] = latest_response.get("answer")
+            if not context.get("last_response_type") and latest_response.get("response_type"):
+                context["last_response_type"] = latest_response.get("response_type")
+            context["last_response_time"] = latest_response.get("created_at")
             # 🆕 เก็บ response object ไว้เพื่อใช้ embeddings (ถ้ามี)
             context["_last_response_obj"] = latest_response
         
@@ -657,7 +844,7 @@ def calculate_semantic_similarity(text1: str, text2: str, model=None) -> float:
         
         # โหลด embedding model ถ้ายังไม่มี
         if model is None:
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
         
         # สร้าง embeddings
         embedding1 = model.encode(text1, convert_to_numpy=True)
@@ -714,7 +901,7 @@ def check_follow_up_question_with_semantic_similarity(
             return False, 0.0
         
         # โหลด embedding model
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
         
         # สร้าง embedding สำหรับคำถามปัจจุบัน
         current_question_embedding = model.encode(question, convert_to_numpy=True)
@@ -890,6 +1077,58 @@ def refine_follow_up_question_with_llm(question: str, user_context: dict = None)
             f"LLM Question Refinement: '{question[:50]}...' -> '{refined_question[:50]}...'"
         )
         
+        # ประเมินคุณภาพของคำถามที่ปรับปรุงแล้ว
+        try:
+            evaluation_prompt = f"""คุณเป็นผู้เชี่ยวชาญในการประเมินคุณภาพของคำถามที่ปรับปรุงแล้ว
+
+คำถามเดิม: "{question}"
+คำถามที่ปรับปรุงแล้ว: "{refined_question}"
+คำถามก่อนหน้า: "{last_question}"
+คำตอบก่อนหน้า: "{last_response[:500]}..."
+
+กรุณาประเมินคุณภาพของคำถามที่ปรับปรุงแล้วตามเกณฑ์ต่อไปนี้ (ให้คะแนน 1-10):
+1. ความชัดเจน: คำถามที่ปรับปรุงแล้วชัดเจนและเข้าใจง่ายหรือไม่
+2. ความเกี่ยวข้อง: คำถามที่ปรับปรุงแล้วเกี่ยวข้องกับบริบทการสนทนาก่อนหน้าหรือไม่
+3. ความสมบูรณ์: คำถามที่ปรับปรุงแล้วมีข้อมูลครบถ้วนหรือไม่
+4. การปรับปรุง: คำถามที่ปรับปรุงแล้วดีกว่าคำถามเดิมหรือไม่
+
+ตอบแค่ตัวเลขคะแนนรวม (1-10) เท่านั้น:"""
+            
+            evaluation_response = client.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": "คุณเป็นผู้เชี่ยวชาญในการประเมินคุณภาพของคำถาม ตอบแค่ตัวเลขคะแนน 1-10 เท่านั้น"},
+                    {"role": "user", "content": evaluation_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=10
+            )
+            
+            score_text = evaluation_response.choices[0].message.content.strip()
+            # แยกตัวเลขจากข้อความ (กรณีที่โมเดลตอบมาพร้อมข้อความอื่น)
+            score_match = re.search(r'\d+', score_text)
+            if score_match:
+                score = int(score_match.group())
+                # จำกัดคะแนนให้อยู่ในช่วง 1-10
+                score = max(1, min(10, score))
+            else:
+                score = 5  # ค่า default ถ้าไม่สามารถแยกตัวเลขได้
+            
+            # พิมพ์คะแนนลง terminal
+            print(f"\n{'='*60}")
+            print(f"📊 การประเมินคุณภาพของคำถามที่ปรับปรุงแล้ว")
+            print(f"{'='*60}")
+            print(f"คำถามเดิม: {question}")
+            print(f"คำถามที่ปรับปรุงแล้ว: {refined_question}")
+            print(f"คะแนนการประเมิน: {score}/10")
+            print(f"{'='*60}\n")
+            
+            logger.info(f"Query refinement self-evaluation score: {score}/10")
+            
+        except Exception as eval_error:
+            logger.warning(f"Error in query refinement self-evaluation: {eval_error}")
+            print(f"\n⚠️  ไม่สามารถประเมินคุณภาพของคำถามที่ปรับปรุงแล้วได้: {eval_error}\n")
+        
         return refined_question
         
     except Exception as e:
@@ -981,6 +1220,60 @@ def check_follow_up_question_with_llm(question: str, user_context: dict = None) 
             f"(is_follow_up: {is_follow_up})"
         )
         
+        # ประเมินตัวเองเมื่อตรวจพบว่าเป็น follow-up
+        if is_follow_up:
+            try:
+                evaluation_prompt = f"""คุณเป็นผู้เชี่ยวชาญในการประเมินความมั่นใจในการตัดสินใจว่าเป็นคำถามต่อเนื่องหรือไม่
+
+คำถามก่อนหน้า: "{last_question}"
+คำตอบก่อนหน้า: "{last_response[:300]}..."
+คำถามปัจจุบัน: "{question}"
+ผลการตัดสิน: YES (เป็นคำถามต่อเนื่อง)
+
+กรุณาประเมินความมั่นใจในการตัดสินใจนี้ตามเกณฑ์ต่อไปนี้ (ให้คะแนน 1-10):
+1. ความเกี่ยวข้อง: คำถามปัจจุบันเกี่ยวข้องกับคำถามก่อนหน้าหรือคำตอบก่อนหน้ามากแค่ไหน
+2. ความต่อเนื่อง: คำถามปัจจุบันเป็นคำถามต่อเนื่องจากบริบทการสนทนาก่อนหน้าหรือไม่
+3. ความชัดเจน: การตัดสินใจนี้ชัดเจนและแน่ใจแค่ไหน
+4. ความเหมาะสม: การตัดสินใจว่าเป็น follow-up นี้เหมาะสมหรือไม่
+
+ตอบแค่ตัวเลขคะแนนรวม (1-10) เท่านั้น:"""
+                
+                evaluation_response = client.chat.completions.create(
+                    model=openai_model,
+                    messages=[
+                        {"role": "system", "content": "คุณเป็นผู้เชี่ยวชาญในการประเมินความมั่นใจในการตัดสินใจ ตอบแค่ตัวเลขคะแนน 1-10 เท่านั้น"},
+                        {"role": "user", "content": evaluation_prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=10
+                )
+                
+                score_text = evaluation_response.choices[0].message.content.strip()
+                # แยกตัวเลขจากข้อความ (กรณีที่โมเดลตอบมาพร้อมข้อความอื่น)
+                score_match = re.search(r'\d+', score_text)
+                if score_match:
+                    score = int(score_match.group())
+                    # จำกัดคะแนนให้อยู่ในช่วง 1-10
+                    score = max(1, min(10, score))
+                else:
+                    score = 5  # ค่า default ถ้าไม่สามารถแยกตัวเลขได้
+                
+                # พิมพ์คะแนนลง terminal
+                print(f"\n{'='*60}")
+                print(f"📊 การประเมินตัวเอง: Follow-up Detection")
+                print(f"{'='*60}")
+                print(f"คำถามก่อนหน้า: {last_question}")
+                print(f"คำถามปัจจุบัน: {question}")
+                print(f"ผลการตัดสิน: YES (เป็นคำถามต่อเนื่อง)")
+                print(f"คะแนนการประเมินความมั่นใจ: {score}/10")
+                print(f"{'='*60}\n")
+                
+                logger.info(f"Follow-up detection self-evaluation score: {score}/10")
+                
+            except Exception as eval_error:
+                logger.warning(f"Error in follow-up detection self-evaluation: {eval_error}")
+                print(f"\n⚠️  ไม่สามารถประเมินความมั่นใจในการตัดสินใจ follow-up ได้: {eval_error}\n")
+        
         return is_follow_up
         
     except Exception as e:
@@ -1008,7 +1301,13 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
     user_context = get_user_context(user_id)
     
     # ตรวจสอบว่าเป็นคำถามต่อเนื่องหรือไม่โดยใช้ LLM (ตาม diagram)
+    print(f"\n{'='*60}")
+    print(f"🔍 กำลังตรวจสอบว่าเป็น Follow-up Question...")
+    print(f"{'='*60}")
+    print(f"คำถามปัจจุบัน: {question}")
     is_follow_up_question = check_follow_up_question_with_llm(question, user_context)
+    print(f"ผลการตรวจสอบ: {'YES (เป็น follow-up)' if is_follow_up_question else 'NO (ไม่ใช่ follow-up)'}")
+    print(f"{'='*60}\n")
     logger.info(f"Follow-up detection (LLM): question='{question[:50]}...', is_follow_up={is_follow_up_question}")
     
     user_birth_date = user_context.get("birth_date") if user_context else None
@@ -1101,128 +1400,374 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
     # วิเคราะห์เจตนาของคำถาม
     question_intent = analyze_question_intent(question)
     
+    # 🆕 ปรับปรุง query เมื่อมีข้อมูลวันเกิดในคำถาม - ใช้ชื่อราศีแทนวันเกิดเพื่อให้ค้นหาได้ดีขึ้น
+    if astrology_chart and astrology_chart.get('zodiac_sign'):
+        zodiac_sign = astrology_chart['zodiac_sign']
+        # ตรวจสอบว่าคำถามมีวันเกิดหรือไม่ (เช่น "07/09/2003" หรือ "ทำนายดวง")
+        has_birth_date_in_question = bool(birth_info_from_question and birth_info_from_question.get('date'))
+        
+        # ถ้ามีวันเกิดในคำถาม ให้สร้าง query ที่ใช้ชื่อราศีแทน
+        if has_birth_date_in_question:
+            # สร้าง query ที่ใช้ชื่อราศีแทนวันเกิด และเพิ่มคำสำคัญที่ตรงกับข้อมูลในฐานข้อมูล
+            # ใช้คำที่หลากหลายเพื่อเพิ่มโอกาสในการค้นหา
+            if 'ราศีอะไร' in question or 'ราศี' in question:
+                # ใช้ query ที่ตรงกับข้อมูลในฐานข้อมูลมากขึ้น - หลากหลายคำ
+                question = f"ราศี{zodiac_sign} ลักษณะนิสัย บุคลิกภาพ โหราศาสตร์"
+            elif 'ทำนายดวง' in question or 'ดวงชะตา' in question or 'ดวงกำเนิด' in question:
+                question = f"ราศี{zodiac_sign} ลักษณะนิสัย การงาน การเงิน ความรัก โหราศาสตร์"
+            else:
+                # ถ้ามีวันเกิดแต่ไม่มี keyword ชัดเจน ให้เพิ่มชื่อราศีใน query
+                question = f"ราศี{zodiac_sign} {question} โหราศาสตร์"
+            
+            logger.info(f"ปรับปรุง query สำหรับวันเกิด: ใช้ชื่อราศี '{zodiac_sign}' แทนวันเกิด -> '{question}'")
+    
     # ปรับปรุงคำถามให้ชัดเจนขึ้นสำหรับคำถามต่อเนื่องโดยใช้ LLM
     if is_follow_up_question and user_context:
+        print(f"\n{'='*60}")
+        print(f"🔄 กำลังปรับปรุงคำถาม (Refine Query)...")
+        print(f"{'='*60}")
+        print(f"คำถามเดิม: {question}")
         refined_question = refine_follow_up_question_with_llm(question, user_context)
         if refined_question and refined_question != question:
             logger.info(f"Question refined: '{question[:50]}...' -> '{refined_question[:50]}...'")
             question = refined_question
+        else:
+            print(f"คำถามไม่มีการเปลี่ยนแปลง (ไม่จำเป็นต้องปรับปรุง)")
+            print(f"{'='*60}\n")
+    else:
+        if not is_follow_up_question:
+            print(f"\n{'='*60}")
+            print(f"ℹ️  ไม่ใช่ Follow-up Question - ไม่มีการ Refine Query")
+            print(f"{'='*60}\n")
     
     # ลองค้นหาจาก MongoDB แบบ Manual Search
     retrieved_docs = []
     try:
-        # print("กำลังค้นหาจาก MongoDB แบบ Manual Search...")
+        print("🔍 กำลังค้นหาจาก MongoDB...")
         
-        # โหลด embedding model
-        import numpy as np
+        # 🆕 ตรวจสอบการเชื่อมต่อ MongoDB ก่อนทำ retrieval
+        print(f"\n{'='*60}")
+        print(f"🔍 กำลังตรวจสอบการเชื่อมต่อ MongoDB...")
+        print(f"{'='*60}")
+        is_ready, verify_message, conn_info = verify_mongodb_connection_for_retrieval()
+        print(f"{verify_message}")
+        print(f"{'='*60}\n")
         
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        query_embedding = model.encode(question)
-        # print(f"สร้าง query embedding สำเร็จ (ขนาด: {len(query_embedding)})")
-        
-        # ✅ ค้นหาจาก processed collections ใน SUMMARY_DB_NAME เท่านั้น (ใช้ summary และ embeddings)
-        # ✅ ไม่ใช้ original collections (เก็บต้นฉบับเท่านั้น ไม่มี embeddings)
-        # ต้องตรงกับชื่อ collection ที่ pipeline multimodel_rag สร้างไว้
-        collections_to_search = [
-            "processed_text_chunks",      # ✅ มี summary และ embeddings
-            "processed_image_chunks",     # ✅ มี summary, embeddings (text), และ image_embeddings
-            "processed_table_chunks",     # ✅ มี summary และ embeddings
-        ]
-        
-        for collection_name in collections_to_search:
-            try:
-                # print(f"ค้นหาใน collection: {collection_name} (SUMMARY_DB)")
-                mongo_uri = os.getenv("MONGO_URL")
-                if not mongo_uri or mongo_uri == "mongodb+srv://your-username:your-password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority":
-                    # print("MONGO_URL not configured properly. Please set up your .env file with valid MongoDB connection string.")
-                    continue
-                client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
-                collection = client[SUMMARY_DB_NAME][collection_name]
+        if not is_ready:
+            print(f"⚠️ MongoDB ไม่พร้อมใช้งานสำหรับ retrieval: {verify_message}")
+            print(f"   การค้นหาจาก MongoDB ถูกข้าม")
+            retrieved_docs = []
+        else:
+            # โหลด embedding model
+            import numpy as np
+            
+            # ใช้ CPU เพื่อหลีกเลี่ยงปัญหา MPS device
+            model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
+            query_embedding = model.encode(question)
+            print(f"✅ สร้าง query embedding สำเร็จ (ขนาด: {len(query_embedding)} dimensions)")
+            
+            # ✅ ค้นหาจาก processed collections ใน SUMMARY_DB_NAME เท่านั้น (ใช้ summary และ embeddings)
+            # ✅ ไม่ใช้ original collections (เก็บต้นฉบับเท่านั้น ไม่มี embeddings)
+            # ต้องตรงกับชื่อ collection ที่ pipeline multimodel_rag สร้างไว้
+            collections_to_search = [
+                "processed_text_chunks",      # ✅ มี summary และ embeddings
+                "processed_image_chunks",     # ✅ มี summary, embeddings (text), และ image_embeddings
+                "processed_table_chunks",     # ✅ มี summary และ embeddings
+            ]
+            
+            # 🆕 ใช้ client ที่ได้จากการตรวจสอบแล้ว
+            client = conn_info.get('client')
+            db = conn_info.get('db')
+            
+            # แก้ไข: MongoDB database objects ไม่สามารถใช้ truth value testing ได้
+            if client is None or db is None:
+                print("⚠️ ไม่สามารถใช้ MongoDB connection ที่ตรวจสอบแล้วได้")
+                retrieved_docs = []
+            else:
+                print(f"🔗 ใช้ MongoDB connection ที่ตรวจสอบแล้ว")
+                print(f"   Database: {SUMMARY_DB_NAME}")
+                print(f"   Collections ที่จะค้นหา: {collections_to_search}")
                 
-                # ดึงข้อมูลทั้งหมด
-                docs = list(collection.find({}))
-                # print(f"จำนวนเอกสารใน {collection_name}: {len(docs)}")
-                
-                if docs:
-                    # ✅ คำนวณ similarity scores (ใช้ embeddings ที่สร้างจาก summary)
-                    # ✅ embeddings ใน processed chunks ถูกสร้างจาก summary text (ไม่ใช่ text ต้นฉบับ)
-                    similarities = []
-                    for doc in docs:
-                        if 'embeddings' in doc:
-                            # ✅ embeddings ถูกสร้างจาก summary text (ใน multimodel_rag.py)
-                            doc_embedding = np.array(doc['embeddings'])
-                            similarity = np.dot(query_embedding, doc_embedding) / (
-                                np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
-                            )
-                            similarities.append((similarity, doc))
-                    
-                    # เรียงตาม similarity score
-                    similarities.sort(key=lambda x: x[0], reverse=True)
-                    
-                    # เอาข้อมูลที่มี similarity สูงสุด 2 อันดับแรก
-                    top_docs = similarities[:2]
-                    # print(f"พบเอกสารที่เกี่ยวข้องใน {collection_name}: {len(top_docs)} เอกสาร")
-                    
-                    # แสดง similarity score สูงสุด
-                    if top_docs:
-                        max_similarity = top_docs[0][0]
-                        # print(f"Similarity score สูงสุด: {max_similarity:.4f}")
-                        pass
-                    
-                    for i, (similarity, doc) in enumerate(top_docs):
-                        # เพิ่มข้อมูล source
-                        source_info = f"[{collection_name}]"
-                        if 'page' in doc:
-                            source_info += f" หน้า {doc['page']}"
-                        if 'chunk_id' in doc:
-                            source_info += f" Chunk {doc['chunk_id']}"
-                        if 'type' in doc:
-                            source_info += f" ({doc['type']})"
-                        
-                        # ใช้ข้อมูลจาก summary database เท่านั้น
-                        summary_content = get_summary_content(doc.get('_id'), collection_name)
-                        
-                        doc_info = {
-                            'text': doc['text'],
-                            'summary': doc.get('summary', ''),
-                            'summary_content': summary_content,
-                            'source': source_info,
-                            'similarity': similarity,
-                            'collection': collection_name,
-                            'doc_id': doc.get('_id')
-                        }
-                        
-                        # เพิ่มเอกสารทั้งหมด แต่ mark ว่าต่ำกว่า threshold หรือไม่
-                        if similarity > 0.2:  # ลด threshold จาก 0.3 เป็น 0.2
-                            # print(f"\nเอกสารที่ {i+1} จาก {collection_name} (Similarity: {similarity:.4f}):")
-                            # print(f"   เนื้อหา: {doc['text'][:200]}...")
-                            # print(f"   แหล่งที่มา: {source_info}")
-                            retrieved_docs.append(doc_info)
+                try:
+                    # แสดงข้อมูล collections ที่มี
+                    collections_status = conn_info.get('collections', {})
+                    for collection_name in collections_to_search:
+                        status = collections_status.get(collection_name, {})
+                        if status.get('exists'):
+                            print(f"   ✅ {collection_name}: {status.get('doc_count', 0)} เอกสาร, มี embeddings: {status.get('has_embeddings', False)}")
                         else:
-                            # print(f"เอกสารที่ {i+1} มี similarity ต่ำเกินไป: {similarity:.4f}")
-                            # เพิ่มเอกสารที่ต่ำกว่า threshold เพื่อแสดงใน terminal
-                            doc_info['below_threshold'] = True
-                            retrieved_docs.append(doc_info)
-                
-                client.close()
+                            print(f"   ❌ {collection_name}: ไม่มี collection นี้")
                     
-            except Exception as e:
-                # print(f"ไม่สามารถค้นหาใน {collection_name} ได้: {e}")
-                continue
+                    print("✅ MongoDB พร้อมสำหรับ retrieval")
+                    
+                    # เริ่มทำ retrieval โดยใช้ client และ db ที่ตรวจสอบแล้ว
+                    for collection_name in collections_to_search:
+                        try:
+                            print(f"📂 กำลังค้นหาใน collection: {collection_name}")
+                            
+                            # ตรวจสอบว่า collection มีอยู่จริงและมีข้อมูล
+                            collection_status = collections_status.get(collection_name, {})
+                            if not collection_status.get('exists'):
+                                print(f"   ⚠️ Collection '{collection_name}' ไม่มีอยู่ใน database!")
+                                continue
+                            
+                            if collection_status.get('doc_count', 0) == 0:
+                                print(f"   ⚠️ Collection '{collection_name}' ว่างเปล่า (0 เอกสาร)")
+                                continue
+                            
+                            # ใช้ collection จาก db ที่ตรวจสอบแล้ว
+                            collection = db[collection_name]
+                            
+                            # ดึงข้อมูลทั้งหมด
+                            docs = list(collection.find({}))
+                            print(f"   พบเอกสารใน {collection_name}: {len(docs)} เอกสาร")
+                            
+                            # Debug: แสดงโครงสร้างของเอกสารแรก (ถ้ามี)
+                            if docs:
+                                first_doc = docs[0]
+                                print(f"   📋 โครงสร้างเอกสารแรก (ตัวอย่าง):")
+                                print(f"      - Fields: {list(first_doc.keys())}")
+                                print(f"      - มี 'embeddings': {'embeddings' in first_doc}")
+                                if 'embeddings' in first_doc:
+                                    emb = first_doc['embeddings']
+                                    print(f"      - Embedding type: {type(emb)}, length: {len(emb) if isinstance(emb, (list, np.ndarray)) else 'N/A'}")
+                                print(f"      - มี 'summary': {'summary' in first_doc}")
+                                print(f"      - มี 'text': {'text' in first_doc}")
+                            
+                            if docs:
+                                # ✅ คำนวณ similarity scores (ใช้ embeddings ที่สร้างจาก summary)
+                                # ✅ embeddings ใน processed chunks ถูกสร้างจาก summary text (ไม่ใช่ text ต้นฉบับ)
+                                similarities = []
+                                docs_without_embeddings = 0
+                                docs_with_dimension_mismatch = 0
+                                
+                                for doc_idx, doc in enumerate(docs):
+                                    if 'embeddings' not in doc:
+                                        docs_without_embeddings += 1
+                                        if doc_idx < 3:  # แสดงเฉพาะ 3 ตัวแรกเพื่อไม่ให้ output เยอะเกินไป
+                                            print(f"   ⚠️ เอกสารที่ {doc_idx+1} ไม่มี field 'embeddings'")
+                                        continue
+                                    
+                                    try:
+                                        # ✅ embeddings ถูกสร้างจาก summary text (ใน multimodel_rag.py)
+                                        doc_embedding = np.array(doc['embeddings'])
+                                        
+                                        # ตรวจสอบว่า dimensions ตรงกัน
+                                        if len(doc_embedding) != len(query_embedding):
+                                            docs_with_dimension_mismatch += 1
+                                            if doc_idx < 3:
+                                                print(f"   ⚠️ Warning: Embedding dimensions ไม่ตรงกัน (doc: {len(doc_embedding)}, query: {len(query_embedding)})")
+                                            continue
+                                        
+                                        similarity = np.dot(query_embedding, doc_embedding) / (
+                                            np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
+                                        )
+                                        similarities.append((similarity, doc))
+                                    except Exception as emb_error:
+                                        if doc_idx < 3:
+                                            print(f"   ❌ Error ในการคำนวณ similarity สำหรับเอกสารที่ {doc_idx+1}: {emb_error}")
+                                        continue
+                                
+                                # แสดงสรุปปัญหา
+                                if docs_without_embeddings > 0:
+                                    print(f"   ⚠️ พบเอกสารที่ไม่มี embeddings: {docs_without_embeddings}/{len(docs)} เอกสาร")
+                                if docs_with_dimension_mismatch > 0:
+                                    print(f"   ⚠️ พบเอกสารที่มี embedding dimension ไม่ตรงกัน: {docs_with_dimension_mismatch}/{len(docs)} เอกสาร")
+                                
+                                if len(similarities) == 0:
+                                    print(f"   ⚠️ ไม่สามารถคำนวณ similarity ได้เลย (ไม่มีเอกสารที่มี embeddings ที่ถูกต้อง)")
+                                    print(f"   💡 ตรวจสอบว่า:")
+                                    print(f"      - เอกสารมี field 'embeddings' หรือไม่")
+                                    print(f"      - Embedding dimensions ตรงกับ query embedding หรือไม่ ({len(query_embedding)} dimensions)")
+                                    # 🆕 ถ้าไม่มี similarities และมีวันเกิด ให้ลองใช้ query ที่ง่ายกว่า
+                                    if birth_info_from_question and birth_info_from_question.get('date'):
+                                        print(f"   🔄 ลองใช้ query ที่ง่ายกว่า: 'โหราศาสตร์'")
+                                        simple_query_emb = model.encode("โหราศาสตร์")
+                                        simple_similarities = []
+                                        for doc in docs:
+                                            if 'embeddings' in doc:
+                                                try:
+                                                    doc_emb = np.array(doc['embeddings'])
+                                                    if len(doc_emb) == len(simple_query_emb):
+                                                        sim = np.dot(simple_query_emb, doc_emb) / (
+                                                            np.linalg.norm(simple_query_emb) * np.linalg.norm(doc_emb)
+                                                        )
+                                                        simple_similarities.append((sim, doc))
+                                                except:
+                                                    continue
+                                        if simple_similarities:
+                                            simple_similarities.sort(key=lambda x: x[0], reverse=True)
+                                            top_simple = simple_similarities[:3]  # เอา 3 อันดับแรก
+                                            print(f"   ✅ พบ {len(simple_similarities)} เอกสารด้วย query 'โหราศาสตร์'")
+                                            for i, (sim, doc) in enumerate(top_simple):
+                                                if sim > 0.10:  # threshold ต่ำสำหรับ fallback
+                                                    source_info = f"[{collection_name}]"
+                                                    if 'page' in doc:
+                                                        source_info += f" หน้า {doc['page']}"
+                                                    summary_content = get_summary_content(doc.get('_id'), collection_name)
+                                                    doc_info = {
+                                                        'text': doc.get('text', ''),
+                                                        'summary': doc.get('summary', ''),
+                                                        'summary_content': summary_content,
+                                                        'source': source_info,
+                                                        'similarity': sim,
+                                                        'collection': collection_name,
+                                                        'doc_id': doc.get('_id'),
+                                                        'fallback_query': True  # ระบุว่าเป็น fallback query
+                                                    }
+                                                    retrieved_docs.append(doc_info)
+                                                    print(f"   ✅ เอกสาร fallback ที่ {i+1} (Similarity: {sim:.4f})")
+                                    continue
+                                
+                                # เรียงตาม similarity score
+                                similarities.sort(key=lambda x: x[0], reverse=True)
+                                
+                                # เอาข้อมูลที่มี similarity สูงสุด 5 อันดับแรก (เพิ่มจาก 2 เป็น 5)
+                                top_docs = similarities[:5]
+                                print(f"   ✅ คำนวณ similarity สำเร็จ: {len(similarities)} เอกสาร (จาก {len(docs)} เอกสารทั้งหมด)")
+                                
+                                # แสดง similarity score ทั้งหมด (เฉพาะ 10 อันดับแรก)
+                                if similarities:
+                                    print(f"   📊 Similarity scores (10 อันดับแรก):")
+                                    for i, (sim, _) in enumerate(similarities[:10], 1):
+                                        print(f"      {i}. {sim:.4f}")
+                                
+                                # 🆕 คำนวณ threshold ก่อน (ใช้ threshold ที่ต่ำกว่าสำหรับคำถามที่มีวันเกิด)
+                                threshold = 0.10 if (birth_info_from_question and birth_info_from_question.get('date')) else 0.15
+                                
+                                # แสดง similarity score สูงสุด
+                                if top_docs:
+                                    max_similarity = top_docs[0][0]
+                                    min_similarity = top_docs[-1][0]
+                                    print(f"   📊 Similarity score: สูงสุด = {max_similarity:.4f}, ต่ำสุด (top 5) = {min_similarity:.4f}, Threshold = {threshold}")
+                                
+                                for i, (similarity, doc) in enumerate(top_docs):
+                                    # เพิ่มข้อมูล source
+                                    source_info = f"[{collection_name}]"
+                                    if 'page' in doc:
+                                        source_info += f" หน้า {doc['page']}"
+                                    if 'chunk_id' in doc:
+                                        source_info += f" Chunk {doc['chunk_id']}"
+                                    if 'type' in doc:
+                                        source_info += f" ({doc['type']})"
+                                    
+                                    # ใช้ข้อมูลจาก summary database เท่านั้น
+                                    summary_content = get_summary_content(doc.get('_id'), collection_name)
+                                    
+                                    doc_info = {
+                                        'text': doc.get('text', ''),
+                                        'summary': doc.get('summary', ''),
+                                        'summary_content': summary_content,
+                                        'source': source_info,
+                                        'similarity': similarity,
+                                        'collection': collection_name,
+                                        'doc_id': doc.get('_id')
+                                    }
+                                    
+                                    if similarity > threshold:
+                                        print(f"   ✅ เอกสารที่ {i+1} จาก {collection_name} (Similarity: {similarity:.4f}) - ผ่าน threshold ({threshold})")
+                                        retrieved_docs.append(doc_info)
+                                    else:
+                                        # เพิ่มเอกสารที่ต่ำกว่า threshold เพื่อแสดงใน terminal
+                                        doc_info['below_threshold'] = True
+                                        retrieved_docs.append(doc_info)
+                                        print(f"   ⚠️ เอกสารที่ {i+1} มี similarity ต่ำเกินไป: {similarity:.4f} < {threshold} (threshold)")
+                        except Exception as e:
+                            print(f"   ❌ ไม่สามารถค้นหาใน {collection_name} ได้: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            continue
+                    
+                    # สรุปผลการค้นหา
+                    # 🆕 นับจำนวนเอกสารที่ผ่าน threshold จริงๆ
+                    valid_count = sum(1 for doc in retrieved_docs if not doc.get('below_threshold', False))
+                    print(f"✅ ดึงข้อมูลจาก MongoDB เสร็จสิ้น: พบ {len(retrieved_docs)} เอกสารทั้งหมด, {valid_count} เอกสารที่ผ่าน threshold")
+                    
+                    # ไม่ต้องปิด client ที่นี่ เพราะใช้ client จาก verify function
+                    # จะปิดภายหลังเมื่อเสร็จสิ้นการใช้งาน
+                    
+                except Exception as retrieval_error:
+                    print(f"   ❌ เกิดข้อผิดพลาดในการทำ retrieval: {retrieval_error}")
+                    import traceback
+                    traceback.print_exc()
+                    retrieved_docs = []
+                finally:
+                    # ปิด connection หลังจากการใช้งานเสร็จสิ้น
+                    if client:
+                        try:
+                            client.close()
+                            logger.debug("Closed MongoDB connection after retrieval")
+                        except:
+                            pass
                 
     except Exception as e:
-        # print(f"ไม่สามารถค้นหาจาก MongoDB ได้: {e}")
-        # print("ใช้ GPT โดยตรงแทน")
+        print(f"❌ ไม่สามารถค้นหาจาก MongoDB ได้: {e}")
+        import traceback
+        traceback.print_exc()
         pass
     
     # หมายเหตุ: รายงานสรุปจะพิมพ์หลังจากได้คำตอบแล้ว เพื่อรวมความยาวคำตอบด้วย
     
-    # ใช้ direct GPT เพราะ vector store ไม่มีข้อมูล
+    # กรองเฉพาะเอกสารที่ผ่าน threshold (ไม่มี below_threshold flag)
+    valid_retrieved_docs = [doc for doc in retrieved_docs if not doc.get('below_threshold', False)]
+    
+    # 🆕 Debug: แสดงจำนวนเอกสารที่กรองแล้ว
+    print(f"\n🔍 Debug: จำนวนเอกสารทั้งหมด: {len(retrieved_docs)}, เอกสารที่ผ่าน threshold: {len(valid_retrieved_docs)}")
+    if len(retrieved_docs) > 0 and len(valid_retrieved_docs) == 0:
+        print(f"⚠️ Warning: มีเอกสาร {len(retrieved_docs)} เอกสาร แต่ไม่มีเอกสารที่ผ่าน threshold")
+        print(f"   ตรวจสอบเอกสารที่ 1-3:")
+        for i, doc in enumerate(retrieved_docs[:3], 1):
+            print(f"   {i}. Similarity: {doc.get('similarity', 'N/A')}, below_threshold: {doc.get('below_threshold', False)}")
+    
+    # ตรวจสอบว่ามีเอกสารจาก MongoDB หรือไม่
+    # 🆕 ระบบ RAG ต้องใช้ข้อมูลจาก MongoDB ในการตอบคำถาม (ใช้ cosine similarity)
+    # ถ้าไม่พบข้อมูลจาก MongoDB ให้ return error message
+    if not valid_retrieved_docs or len(valid_retrieved_docs) == 0:
+        print("\n⚠️ ไม่พบข้อมูลจาก MongoDB - ระบบ RAG ต้องใช้ข้อมูลจาก MongoDB ในการตอบคำถาม")
+        
+        # แสดงรายงานบนเทอร์มินัลสำหรับ RAGAS
+        answer = "ขออภัยค่ะ ไม่พบข้อมูลที่เกี่ยวข้องในฐานข้อมูลสำหรับคำถามนี้ กรุณาลองใช้คำถามที่เกี่ยวข้องกับโหราศาสตร์ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์' ค่ะ"
+        
+        try:
+            print_ragas_terminal_report(
+                question=question,
+                retrieved_docs=retrieved_docs,  # ส่งทั้งเอกสารทั้งหมดรวมถึงที่ต่ำกว่า threshold เพื่อแสดงในรายงาน
+                answer=answer,
+                user_id=user_id,
+            )
+        except Exception:
+            pass
+        
+        # บันทึก interaction
+        try:
+            context_data = {}
+            if astrology_chart:
+                context_data.update({
+                    "zodiac_sign": astrology_chart.get('zodiac_sign'),
+                    "zodiac_element": astrology_chart.get('zodiac_element'),
+                    "zodiac_quality": astrology_chart.get('zodiac_quality'),
+                    "birth_date": astrology_chart.get('birth_date'),
+                    "birth_time": astrology_chart.get('birth_time'),
+                })
+            
+            store_user_response(
+                question=question,
+                answer=answer,
+                user_id=user_id,
+                response_type="no_data_found",
+                context_data=context_data
+            )
+        except Exception:
+            pass
+        
+        return answer
+
+    # ✅ ใช้ RAG system - ใช้ข้อมูลจาก MongoDB ที่ค้นหาด้วย cosine similarity
     query_vector = []
     # กำหนดธงสำหรับสร้างคำถามต่อเนื่องอัตโนมัติเมื่อมีข้อมูลวันเกิดในคำถาม
     should_create_chart = bool(birth_info_from_question and birth_info_from_question.get('date'))
 
-    # ใช้ GPT โดยตรง (ไม่ใช้ RAG เพราะ vector store ไม่มีข้อมูล)
+    # ✅ ใช้ GPT กับข้อมูลจาก MongoDB (RAG system - ใช้ cosine similarity)
     try:
         from openai import OpenAI
         openai_key = os.getenv("OPENAI_API_KEY")
@@ -1232,30 +1777,41 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         client = OpenAI(api_key=openai_key)
         
         # ✅ สร้าง context จากเอกสารที่ค้นหาได้จาก processed collections เท่านั้น
+        # ✅ ระบบ RAG ใช้ cosine similarity กับข้อมูลที่ embed แล้วจาก MongoDB
         # ✅ ระบบใช้ summary embeddings ในการค้นหา และใช้ summary ในการสร้างคำตอบ
         # ✅ ไม่ใช้ original collections (ไม่มี embeddings)
+        # ✅ ใช้เฉพาะเอกสารที่ผ่าน threshold
         context_info = ""
-        if retrieved_docs:
-            context_info = "\n\nข้อมูลที่เกี่ยวข้องจากฐานข้อมูล astrobot_summary (ใช้ summary และ embeddings):\n"
-            for i, doc in enumerate(retrieved_docs):
+        if valid_retrieved_docs:
+            context_info = "\n\n**ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล (ค้นหาด้วย cosine similarity จาก embeddings):**\n"
+            for i, doc in enumerate(valid_retrieved_docs):
                 if isinstance(doc, dict):
                     # ✅ ใช้ summary เป็นหลัก (เพราะ embeddings ถูกสร้างจาก summary)
                     # ✅ summary กระชับและมีความหมายมากกว่า text ต้นฉบับ
+                    similarity_score = doc.get('similarity', 0)
                     content_to_use = doc.get('summary', doc.get('text', ''))
-                    context_info += f"{i+1}. {content_to_use[:300]}...\n"
+                    context_info += f"{i+1}. [Similarity: {similarity_score:.4f}] {content_to_use[:400]}...\n"
                     
                     # เพิ่มข้อมูลจาก summary database ถ้ามี
                     if doc.get('summary_content'):
                         summary_text = doc['summary_content'].get('text', '')
                         if summary_text and len(summary_text) > 100:
-                            context_info += f"   ข้อมูลเพิ่มเติมจาก summary: {summary_text[:200]}...\n"
+                            context_info += f"   ข้อมูลเพิ่มเติม: {summary_text[:250]}...\n"
                 else:
-                    context_info += f"{i+1}. {doc[:300]}...\n"
-            # print(f"ใช้ข้อมูลจาก astrobot_summary: {len(retrieved_docs)} เอกสาร")
+                    context_info += f"{i+1}. {doc[:400]}...\n"
+            print(f"✅ ใช้ข้อมูลจาก MongoDB (RAG): {len(valid_retrieved_docs)} เอกสาร")
         else:
-            # print("ไม่พบเอกสารที่เกี่ยวข้องใน astrobot_summary จะใช้ความรู้ทั่วไปในการตอบ")
-            # print("ข้อแนะนำ: ลองใช้คำถามที่เกี่ยวข้องกับโหราศาสตร์มากขึ้น เช่น 'ราศี', 'ดาวเคราะห์', 'ดวงชะตา'")
-            pass
+            # ถ้าไม่มีข้อมูลจาก MongoDB แต่มี chart_info ให้ใช้ข้อมูลจาก chart_info เป็น fallback
+            if astrology_chart and astrology_chart.get('zodiac_sign'):
+                print(f"⚠️ ไม่พบข้อมูลจาก MongoDB แต่มีข้อมูลวันเกิด - จะใช้ข้อมูลจาก chart_info เป็น fallback")
+                context_info = "\n\n**ข้อมูลจากวันเกิด (fallback - ไม่พบข้อมูลจาก MongoDB):**\n"
+                context_info += f"ราศี: {astrology_chart.get('zodiac_sign')}\n"
+                if astrology_chart.get('detailed_reading'):
+                    detailed = astrology_chart['detailed_reading']
+                    context_info += f"ลักษณะนิสัย: {detailed.get('ลักษณะนิสัย', 'ไม่มีข้อมูล')[:200]}...\n"
+                    context_info += f"การงาน: {detailed.get('การงาน', 'ไม่มีข้อมูล')[:200]}...\n"
+                    context_info += f"การเงิน: {detailed.get('การเงิน', 'ไม่มีข้อมูล')[:200]}...\n"
+                    context_info += f"ความรัก: {str(detailed.get('ความรัก', 'ไม่มีข้อมูล'))[:200]}...\n"
         
         # สร้างข้อมูลดวงชะตาเพิ่มเติม
         chart_info = ""
@@ -1340,6 +1896,18 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
 """
                 else:
                     chart_info += f"{detailed.get('ความรัก', 'ไม่มีข้อมูลความรัก')}"
+            
+            # เพิ่มข้อมูลสีมงคลถ้ามี
+            if 'lucky_colors' in astrology_chart and astrology_chart['lucky_colors']:
+                lucky_colors = astrology_chart['lucky_colors']
+                bad_colors = astrology_chart.get('bad_colors', [])
+                chart_info += f"""
+
+**สีมงคลสำหรับราศี{astrology_chart['zodiac_sign']}:**
+สีมงคล: {', '.join(lucky_colors) if isinstance(lucky_colors, list) else lucky_colors}
+"""
+                if bad_colors:
+                    chart_info += f"สีที่ควรหลีกเลี่ยง: {', '.join(bad_colors) if isinstance(bad_colors, list) else bad_colors}\n"
 
 
         # สร้าง prompt สำหรับแชทบอทโหราศาสตร์ตะวันตก
@@ -1388,7 +1956,45 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
 - อธิบายว่าทำไมสีเหล่านี้จึงเหมาะกับราศีนี้
 """
         else:
-            focus_instruction = """
+            # 🆕 เมื่อมีวันเกิดในคำถาม ให้ตอบครบทั้ง 4 ด้าน: การงาน การเงิน ความรัก สีมงคล
+            if birth_info_from_question and birth_info_from_question.get('date'):
+                focus_instruction = """
+**⚠️ คำสั่งสำคัญ: เมื่อคำถามมีวันเดือนปีเกิด ต้องตอบครบทั้ง 4 ด้านเสมอ (ห้ามขาดด้านใดด้านหนึ่ง):**
+
+1. **ด้านการงาน (บังคับ):** 
+   - ให้ข้อมูลเกี่ยวกับอาชีพที่เหมาะกับราศีนี้
+   - การทำงานและความสำเร็จในหน้าที่การงาน
+   - ทักษะที่โดดเด่นและจุดแข็งในการทำงาน
+   - อาชีพที่ควรพิจารณา
+
+2. **ด้านการเงิน (บังคับ):**
+   - ให้ข้อมูลเกี่ยวกับการจัดการเงิน
+   - การลงทุนและการออมที่เหมาะ
+   - การสร้างความมั่งคั่ง
+   - แนวทางการบริหารการเงิน
+
+3. **ด้านความรัก (บังคับ):**
+   - ให้ข้อมูลเกี่ยวกับความสัมพันธ์
+   - การเข้ากันได้กับคนอื่น
+   - คำแนะนำสำหรับคนโสด
+   - คำแนะนำสำหรับคนมีคู่
+   - ราศีที่เข้ากันได้ดี
+
+4. **สีมงคล (บังคับ):**
+   - ให้ข้อมูลเกี่ยวกับสีที่เหมาะกับราศีนี้
+   - สีที่ควรหลีกเลี่ยง
+   - ความหมายของสีแต่ละสี
+   - สีที่ควรใช้ในชีวิตประจำวัน
+
+**ข้อกำหนดเพิ่มเติม:**
+- เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
+- **ต้องตอบครบทั้ง 4 ด้านเสมอ** (การงาน, การเงิน, ความรัก, สีมงคล) ห้ามขาดด้านใดด้านหนึ่ง
+- ใช้ข้อมูลจากฐานข้อมูล (MongoDB) ในการตอบคำถาม
+- ห้ามตอบเรื่องสุขภาพ
+- ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+"""
+            else:
+                focus_instruction = """
 **คำสั่งสำคัญ: สำหรับคำถามเกี่ยวกับดวงชะตาโดยรวม ต้องตอบครบทั้ง 4 ด้านเสมอ**
 - **ด้านการงาน:** ให้ข้อมูลเกี่ยวกับอาชีพที่เหมาะ การทำงาน ความสำเร็จในหน้าที่การงาน และทักษะที่โดดเด่น
 - **ด้านการเงิน:** ให้ข้อมูลเกี่ยวกับการจัดการเงิน การลงทุน การออม และการสร้างความมั่งคั่ง
@@ -1403,10 +2009,22 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
             astrology_prompt = f"""คุณเป็นโหราจารย์ดิจิทัลผู้เชี่ยวชาญด้านโหราศาสตร์ตะวันตก (Western Astrology) ที่มีความรู้ลึกซึ้งเกี่ยวกับดาวเคราะห์ ราศี และการตีความดวงกำเนิด
 
 **บทบาทและความเชี่ยวชาญ:**
+- คุณเป็นระบบ RAG (Retrieval-Augmented Generation) ที่ใช้ข้อมูลจากฐานข้อมูล MongoDB ในการตอบคำถาม
+- ข้อมูลที่ใช้ตอบคำถามถูกค้นหาด้วย cosine similarity จาก embeddings ที่สร้างไว้แล้ว
 - คุณมีความเข้าใจในพลังของราศีเกิด และลัคณา (ราศีประจำลัคนา)
-- คุณสามารถผสานข้อมูลจากฐานความรู้เพื่อสร้างคำทำนายที่เฉพาะตัว
+- คุณสามารถผสานข้อมูลจากฐานความรู้ (MongoDB) เพื่อสร้างคำทำนายที่เฉพาะตัวและแม่นยำ
 - คุณให้คำแนะนำที่อบอุ่น เป็นมิตร และให้กำลังใจ
 - คุณสามารถรักษาบริบทการสนทนาและตอบคำถามต่อเนื่องได้อย่างเป็นธรรมชาติ
+
+**⚠️ ข้อกำหนดสำคัญสำหรับ RAG System (บังคับปฏิบัติตามอย่างเคร่งครัด):**
+- **🚨 ห้ามใช้ความรู้จาก training data หรือความรู้ภายนอกใดๆ ทั้งสิ้น**
+- **🚨 ต้องใช้ข้อมูลจากฐานข้อมูล (MongoDB) เท่านั้น** ในการตอบคำถาม
+- **🚨 ห้ามสร้างข้อมูลหรือความรู้ใหม่ขึ้นมาเอง** ต้องใช้เฉพาะข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล"
+- ข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" ถูกค้นหาด้วย cosine similarity จาก embeddings
+- **🚨 ถ้าไม่มีข้อมูลในฐานข้อมูลที่เกี่ยวข้องกับคำถาม ให้บอกว่า "ขออภัยค่ะ ไม่พบข้อมูลที่เกี่ยวข้องในฐานข้อมูลสำหรับคำถามนี้"**
+- **🚨 ห้ามใช้ความรู้ทั่วไปเกี่ยวกับโหราศาสตร์ที่ไม่ได้มาจากฐานข้อมูล**
+- **🚨 ต้องอ้างอิงและใช้ข้อมูลจากฐานข้อมูลเท่านั้น** ในการสร้างคำตอบ
+- **🚨 ถ้ามีข้อมูลจากฐานข้อมูล ต้องใช้ข้อมูลนั้นในการตอบคำถามเท่านั้น ไม่ใช่สร้างคำตอบขึ้นมาเอง**
 
 **ข้อกำหนดสำคัญ:**
 - ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน
@@ -1427,18 +2045,40 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
 
 **คำถามของผู้ใช้:** {question}
 
-**วิธีการตอบคำถาม:**
-1. **สำหรับคำถามใหม่:** เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
-2. **สำหรับคำถามทั่วไปเกี่ยวกับดวงชะตา:** ต้องตอบครบทั้ง 4 ด้าน (ลักษณะนิสัยและบุคลิกภาพ, การงาน, การเงิน, ความรัก) เพื่อให้คำทำนายที่สมบูรณ์
-3. **สำหรับคำถามเฉพาะด้าน:** ตอบเฉพาะด้านที่ถามเท่านั้น (ถ้าถามเกี่ยวกับการงาน ก็ตอบเฉพาะการงาน เท่านั้น)
-4. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง
-5. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้
-6. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ
-7. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
-8. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
-9. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
-10. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
-11. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
+**🚨 ข้อกำหนดสำคัญในการตอบคำถาม (อ่านให้ละเอียด):**
+- **กฎสำคัญที่สุด: เมื่อคำถามมีวันเดือนปีเกิด (เช่น "07/09/2003", "ทำนายดวง", "ราศีอะไร" พร้อมวันเกิด) → ต้องตอบครบทั้ง 4 ด้านเสมอ (การงาน, การเงิน, ความรัก, สีมงคล) ห้ามขาดด้านใดด้านหนึ่ง**
+- **วิเคราะห์คำถามให้ดีก่อนตอบ:**
+  * **ถ้าถาม "ทำนายดวง" หรือมีวันเดือนปีเกิด → ต้องตอบครบทั้ง 4 ด้าน (การงาน, การเงิน, ความรัก, สีมงคล)**
+  * ถ้าถามว่า "เข้ากับราศีอะไร" หรือ "เข้ากันได้กับราศีอะไร" → ต้องตอบว่าควรเข้ากับราศีอะไร (เช่น ราศีเมษเข้ากับราศีสิงห์ได้ดี)
+  * ถ้าถามว่า "อาชีพที่เหมาะ" หรือ "งานที่เหมาะ" → ต้องตอบว่าอาชีพอะไรที่เหมาะกับราศี
+  * ถ้าถามว่า "นิสัยเป็นยังไง" → ต้องตอบว่าลักษณะนิสัยของราศีนั้น
+  * ถ้าถามว่า "สีมงคล" → ต้องตอบว่าสีอะไรที่เป็นมงคล
+- **ห้ามสับสนระหว่างคำถาม** เช่น ถ้าถาม "เข้ากับราศีอะไร" ห้ามตอบว่า "อาชีพที่เหมาะ" หรือ "ลักษณะนิสัย"
+- **ตอบให้ตรงประเด็น** แต่ถ้ามีวันเดือนปีเกิด ต้องตอบครบทั้ง 4 ด้านเสมอ
+
+**วิธีการตอบคำถาม (RAG System - บังคับปฏิบัติตามอย่างเคร่งครัด):**
+1. **🚨 ต้องใช้ข้อมูลจากฐานข้อมูล (MongoDB) เท่านั้น** - ข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" ถูกค้นหาด้วย cosine similarity จาก embeddings
+2. **🚨 ห้ามใช้ความรู้จาก training data หรือความรู้ภายนอกใดๆ** - ต้องใช้เฉพาะข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" เท่านั้น
+3. **🚨 ถ้าไม่มีข้อมูลในฐานข้อมูลที่เกี่ยวข้องกับคำถาม ให้บอกว่า "ขออภัยค่ะ ไม่พบข้อมูลที่เกี่ยวข้องในฐานข้อมูลสำหรับคำถามนี้"**
+4. **⚠️ สำหรับคำถามที่มีวันเดือนปีเกิด (บังคับ):** 
+   - **ต้องตอบครบทั้ง 4 ด้านเสมอ** (การงาน, การเงิน, ความรัก, สีมงคล) ห้ามขาดด้านใดด้านหนึ่ง
+   - เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
+   - **ใช้ข้อมูลจากฐานข้อมูลเท่านั้น** ในการตอบคำถาม
+   - ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+   - ต้องครอบคลุมทั้ง 4 ด้าน: การงาน, การเงิน, ความรัก, สีมงคล
+   - **ถ้าไม่มีข้อมูลในฐานข้อมูลสำหรับด้านใดด้านหนึ่ง ให้บอกว่า "ไม่พบข้อมูลในฐานข้อมูลสำหรับด้านนี้"**
+5. **สำหรับคำถามทั่วไปเกี่ยวกับดวงชะตา (ไม่มีวันเกิด):** ต้องตอบครบทั้ง 4 ด้าน (ลักษณะนิสัยและบุคลิกภาพ, การงาน, การเงิน, ความรัก) โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น
+6. **สำหรับคำถามเฉพาะด้าน:** ตอบเฉพาะด้านที่ถามเท่านั้น โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น (ถ้าถามเกี่ยวกับการงาน ก็ตอบเฉพาะการงาน เท่านั้น)
+7. **สำหรับคำถามเกี่ยวกับความเข้ากันได้ของราศี:** ต้องตอบว่าควรเข้ากับราศีอะไร โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น
+8. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น
+9. **🚨 อ้างอิงข้อมูลจากฐานข้อมูลเท่านั้น** - ต้องอ้างอิงและใช้ข้อมูลจาก "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" ในการสร้างคำตอบ ไม่ใช่สร้างคำตอบขึ้นมาเอง
+10. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้ (MongoDB) เท่านั้น
+11. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ (แต่ต้องใช้ข้อมูลจากฐานข้อมูลเท่านั้น)
+12. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
+13. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
+14. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+15. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
+16. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
 
 **การจัดการคำถามต่อเนื่อง:**
 - ถ้าผู้ใช้ถามเกี่ยวกับ "ราศีนี้", "นิสัย", "ลักษณะ", "คนราศีนี้" โดยไม่ระบุราศี ให้ใช้ราศีจากข้อมูลบริบท
@@ -1467,15 +2107,33 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
 - **หากมีข้อมูลดวงชะตาแล้ว ให้ใช้ข้อมูลนั้นในการตอบคำถามทันที ไม่ต้องแจ้งเตือน**
 - **ห้ามส่งข้อความแจ้งเตือนใดๆ ในคำตอบ**
 
+**🚨 สรุปข้อกำหนดสำคัญสำหรับคำถามที่มีวันเดือนปีเกิด:**
+- ต้องตอบครบทั้ง 4 ด้านเสมอ: (1) การงาน, (2) การเงิน, (3) ความรัก, (4) สีมงคล
+- ห้ามขาดด้านใดด้านหนึ่ง
+- ใช้ข้อมูลจากฐานข้อมูล (MongoDB) ในการตอบคำถาม
+- ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+
 กรุณาตอบคำถามตามแนวทางที่กำหนดไว้ โดยใช้ความรู้โหราศาสตร์ตะวันตกและให้คำแนะนำที่เป็นประโยชน์"""
         else:
             astrology_prompt = f"""คุณเป็นโหราจารย์ดิจิทัลผู้เชี่ยวชาญด้านโหราศาสตร์ตะวันตก (Western Astrology) ที่มีความรู้ลึกซึ้งเกี่ยวกับดาวเคราะห์ ราศี และการตีความดวงกำเนิด
 
 **บทบาทและความเชี่ยวชาญ:**
+- คุณเป็นระบบ RAG (Retrieval-Augmented Generation) ที่ใช้ข้อมูลจากฐานข้อมูล MongoDB ในการตอบคำถาม
+- ข้อมูลที่ใช้ตอบคำถามถูกค้นหาด้วย cosine similarity จาก embeddings ที่สร้างไว้แล้ว
 - คุณมีความเข้าใจในพลังของราศีเกิด และลัคณา (ราศีประจำลัคนา)
-- คุณสามารถผสานข้อมูลจากฐานความรู้เพื่อสร้างคำทำนายที่เฉพาะตัว
+- คุณสามารถผสานข้อมูลจากฐานความรู้ (MongoDB) เพื่อสร้างคำทำนายที่เฉพาะตัวและแม่นยำ
 - คุณให้คำแนะนำที่อบอุ่น เป็นมิตร และให้กำลังใจ
 - คุณสามารถรักษาบริบทการสนทนาและตอบคำถามต่อเนื่องได้อย่างเป็นธรรมชาติ
+
+**⚠️ ข้อกำหนดสำคัญสำหรับ RAG System (บังคับปฏิบัติตามอย่างเคร่งครัด):**
+- **🚨 ห้ามใช้ความรู้จาก training data หรือความรู้ภายนอกใดๆ ทั้งสิ้น**
+- **🚨 ต้องใช้ข้อมูลจากฐานข้อมูล (MongoDB) เท่านั้น** ในการตอบคำถาม
+- **🚨 ห้ามสร้างข้อมูลหรือความรู้ใหม่ขึ้นมาเอง** ต้องใช้เฉพาะข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล"
+- ข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" ถูกค้นหาด้วย cosine similarity จาก embeddings
+- **🚨 ถ้าไม่มีข้อมูลในฐานข้อมูลที่เกี่ยวข้องกับคำถาม ให้บอกว่า "ขออภัยค่ะ ไม่พบข้อมูลที่เกี่ยวข้องในฐานข้อมูลสำหรับคำถามนี้"**
+- **🚨 ห้ามใช้ความรู้ทั่วไปเกี่ยวกับโหราศาสตร์ที่ไม่ได้มาจากฐานข้อมูล**
+- **🚨 ต้องอ้างอิงและใช้ข้อมูลจากฐานข้อมูลเท่านั้น** ในการสร้างคำตอบ
+- **🚨 ถ้ามีข้อมูลจากฐานข้อมูล ต้องใช้ข้อมูลนั้นในการตอบคำถามเท่านั้น ไม่ใช่สร้างคำตอบขึ้นมาเอง**
 
 **ข้อกำหนดสำคัญ:**
 - ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน
@@ -1496,18 +2154,40 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
 
 **คำถามของผู้ใช้:** {question}
 
-**วิธีการตอบคำถาม:**
-1. **สำหรับคำถามใหม่:** เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
-2. **สำหรับคำถามทั่วไปเกี่ยวกับดวงชะตา:** ต้องตอบครบทั้ง 4 ด้าน (ลักษณะนิสัยและบุคลิกภาพ, การงาน, การเงิน, ความรัก) เพื่อให้คำทำนายที่สมบูรณ์
-3. **สำหรับคำถามเฉพาะด้าน:** ตอบเฉพาะด้านที่ถามเท่านั้น (ถ้าถามเกี่ยวกับการงาน ก็ตอบเฉพาะการงาน เท่านั้น)
-4. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง
-5. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้
-6. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ
-7. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
-8. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
-9. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
-10. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
-11. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
+**🚨 ข้อกำหนดสำคัญในการตอบคำถาม (อ่านให้ละเอียด):**
+- **กฎสำคัญที่สุด: เมื่อคำถามมีวันเดือนปีเกิด (เช่น "07/09/2003", "ทำนายดวง", "ราศีอะไร" พร้อมวันเกิด) → ต้องตอบครบทั้ง 4 ด้านเสมอ (การงาน, การเงิน, ความรัก, สีมงคล) ห้ามขาดด้านใดด้านหนึ่ง**
+- **วิเคราะห์คำถามให้ดีก่อนตอบ:**
+  * **ถ้าถาม "ทำนายดวง" หรือมีวันเดือนปีเกิด → ต้องตอบครบทั้ง 4 ด้าน (การงาน, การเงิน, ความรัก, สีมงคล)**
+  * ถ้าถามว่า "เข้ากับราศีอะไร" หรือ "เข้ากันได้กับราศีอะไร" → ต้องตอบว่าควรเข้ากับราศีอะไร (เช่น ราศีเมษเข้ากับราศีสิงห์ได้ดี)
+  * ถ้าถามว่า "อาชีพที่เหมาะ" หรือ "งานที่เหมาะ" → ต้องตอบว่าอาชีพอะไรที่เหมาะกับราศี
+  * ถ้าถามว่า "นิสัยเป็นยังไง" → ต้องตอบว่าลักษณะนิสัยของราศีนั้น
+  * ถ้าถามว่า "สีมงคล" → ต้องตอบว่าสีอะไรที่เป็นมงคล
+- **ห้ามสับสนระหว่างคำถาม** เช่น ถ้าถาม "เข้ากับราศีอะไร" ห้ามตอบว่า "อาชีพที่เหมาะ" หรือ "ลักษณะนิสัย"
+- **ตอบให้ตรงประเด็น** แต่ถ้ามีวันเดือนปีเกิด ต้องตอบครบทั้ง 4 ด้านเสมอ
+
+**วิธีการตอบคำถาม (RAG System - บังคับปฏิบัติตามอย่างเคร่งครัด):**
+1. **🚨 ต้องใช้ข้อมูลจากฐานข้อมูล (MongoDB) เท่านั้น** - ข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" ถูกค้นหาด้วย cosine similarity จาก embeddings
+2. **🚨 ห้ามใช้ความรู้จาก training data หรือความรู้ภายนอกใดๆ** - ต้องใช้เฉพาะข้อมูลที่แสดงใน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" เท่านั้น
+3. **🚨 ถ้าไม่มีข้อมูลในฐานข้อมูลที่เกี่ยวข้องกับคำถาม ให้บอกว่า "ขออภัยค่ะ ไม่พบข้อมูลที่เกี่ยวข้องในฐานข้อมูลสำหรับคำถามนี้"**
+4. **⚠️ สำหรับคำถามที่มีวันเดือนปีเกิด (บังคับ):** 
+   - **ต้องตอบครบทั้ง 4 ด้านเสมอ** (การงาน, การเงิน, ความรัก, สีมงคล) ห้ามขาดด้านใดด้านหนึ่ง
+   - เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
+   - **ใช้ข้อมูลจากฐานข้อมูลเท่านั้น** ในการตอบคำถาม
+   - ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+   - ต้องครอบคลุมทั้ง 4 ด้าน: การงาน, การเงิน, ความรัก, สีมงคล
+   - **ถ้าไม่มีข้อมูลในฐานข้อมูลสำหรับด้านใดด้านหนึ่ง ให้บอกว่า "ไม่พบข้อมูลในฐานข้อมูลสำหรับด้านนี้"**
+5. **สำหรับคำถามทั่วไปเกี่ยวกับดวงชะตา (ไม่มีวันเกิด):** ต้องตอบครบทั้ง 4 ด้าน (ลักษณะนิสัยและบุคลิกภาพ, การงาน, การเงิน, ความรัก) โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น
+6. **สำหรับคำถามเฉพาะด้าน:** ตอบเฉพาะด้านที่ถามเท่านั้น โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น (ถ้าถามเกี่ยวกับการงาน ก็ตอบเฉพาะการงาน เท่านั้น)
+7. **สำหรับคำถามเกี่ยวกับความเข้ากันได้ของราศี:** ต้องตอบว่าควรเข้ากับราศีอะไร โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น
+8. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง โดยใช้ข้อมูลจากฐานข้อมูลเท่านั้น
+9. **🚨 อ้างอิงข้อมูลจากฐานข้อมูลเท่านั้น** - ต้องอ้างอิงและใช้ข้อมูลจาก "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" ในการสร้างคำตอบ ไม่ใช่สร้างคำตอบขึ้นมาเอง
+10. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้ (MongoDB) เท่านั้น
+11. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ (แต่ต้องใช้ข้อมูลจากฐานข้อมูลเท่านั้น)
+12. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
+13. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
+14. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+15. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
+16. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
 
 **การจัดการคำถามต่อเนื่อง:**
 - ถ้าผู้ใช้ถามเกี่ยวกับ "ราศีนี้", "นิสัย", "ลักษณะ", "คนราศีนี้" โดยไม่ระบุราศี ให้ใช้ราศีจากข้อมูลบริบท
@@ -1534,13 +2214,45 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
 - หากมีข้อมูลบางส่วนไม่ครบ ให้ใช้ความรู้โหราศาสตร์ทั่วไปในการให้คำแนะนำ
 - ห้ามใช้ข้อความเช่น "ไม่มีข้อมูลเพิ่มเติม", "ไม่สามารถให้คำแนะนำเฉพาะได้", "ข้อมูลไม่เพียงพอ" ในคำตอบ
 
+**🚨 สรุปข้อกำหนดสำคัญสำหรับคำถามที่มีวันเดือนปีเกิด:**
+- ต้องตอบครบทั้ง 4 ด้านเสมอ: (1) การงาน, (2) การเงิน, (3) ความรัก, (4) สีมงคล
+- ห้ามขาดด้านใดด้านหนึ่ง
+- ใช้ข้อมูลจากฐานข้อมูล (MongoDB) ในการตอบคำถาม
+- ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+
 กรุณาตอบคำถามตามแนวทางที่กำหนดไว้ โดยใช้ความรู้โหราศาสตร์ตะวันตกและให้คำแนะนำที่เป็นประโยชน์"""
         
         # สร้าง system prompt ที่เหมาะสม
         if astrology_chart:
-            system_prompt = f"""คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
+            system_prompt = f"""คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด 
+
+**⚠️ ข้อกำหนดสำคัญที่สุด (ต้องปฏิบัติตามอย่างเคร่งครัด):**
+1. **วิเคราะห์คำถามให้ชัดเจนก่อนตอบทุกครั้ง**
+2. **ตอบตรงกับคำถามที่ถามเท่านั้น - ห้ามตอบนอกเรื่อง**
+3. **ห้ามสับสนระหว่างคำถาม:**
+   - ถ้าถาม "เข้ากับราศีอะไร" หรือ "ในด้านการงานเข้ากับคนราศีอะไร" → ต้องตอบว่าควรเข้ากับราศีอะไร (ความเข้ากันได้) ห้ามตอบว่าอาชีพอะไรเหมาะ
+   - ถ้าถาม "อาชีพที่เหมาะ" หรือ "งานที่เหมาะ" (ไม่มีคำว่า "เข้ากับ") → ต้องตอบว่าอาชีพอะไร ห้ามตอบว่าควรเข้ากับราศีอะไร
+4. **ตัวอย่างที่ถูกต้อง:**
+   - คำถาม: "ในด้านการงานเข้ากับคนราศีอะไรได้ดี"
+   - คำตอบที่ถูกต้อง: "ราศีสิงห์เข้ากับราศีเมษ ราศีพฤษภ และราศีธนูได้ดีในด้านการงาน..."
+   - คำตอบที่ผิด: "อาชีพที่เหมาะกับราศีสิงห์คือ..." (ห้ามตอบแบบนี้!)
+
+ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
         else:
-            system_prompt = """คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **หากไม่มีข้อมูลวันเกิดหรือราศี ให้แจ้งเตือนผู้ใช้ให้ระบุข้อมูลก่อน เช่น 'ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ กรุณาระบุวันเกิดก่อน เช่น 09/02/2004 ราศีอะไร'** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
+            system_prompt = """คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด 
+
+**⚠️ ข้อกำหนดสำคัญที่สุด (ต้องปฏิบัติตามอย่างเคร่งครัด):**
+1. **วิเคราะห์คำถามให้ชัดเจนก่อนตอบทุกครั้ง**
+2. **ตอบตรงกับคำถามที่ถามเท่านั้น - ห้ามตอบนอกเรื่อง**
+3. **ห้ามสับสนระหว่างคำถาม:**
+   - ถ้าถาม "เข้ากับราศีอะไร" หรือ "ในด้านการงานเข้ากับคนราศีอะไร" → ต้องตอบว่าควรเข้ากับราศีอะไร (ความเข้ากันได้) ห้ามตอบว่าอาชีพอะไรเหมาะ
+   - ถ้าถาม "อาชีพที่เหมาะ" หรือ "งานที่เหมาะ" (ไม่มีคำว่า "เข้ากับ") → ต้องตอบว่าอาชีพอะไร ห้ามตอบว่าควรเข้ากับราศีอะไร
+4. **ตัวอย่างที่ถูกต้อง:**
+   - คำถาม: "ในด้านการงานเข้ากับคนราศีอะไรได้ดี"
+   - คำตอบที่ถูกต้อง: "ราศีสิงห์เข้ากับราศีเมษ ราศีพฤษภ และราศีธนูได้ดีในด้านการงาน..."
+   - คำตอบที่ผิด: "อาชีพที่เหมาะกับราศีสิงห์คือ..." (ห้ามตอบแบบนี้!)
+
+ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **หากไม่มีข้อมูลวันเกิดหรือราศี ให้แจ้งเตือนผู้ใช้ให้ระบุข้อมูลก่อน เช่น 'ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ กรุณาระบุวันเกิดก่อน เช่น 09/02/2004 ราศีอะไร'** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
         
         # print("กำลังส่งคำถามไปยัง GPT...")
         # ใช้ชื่อโมเดลจาก ENV ถ้าไม่ระบุจะใช้ gpt-4o-mini
@@ -1559,6 +2271,18 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         )
         answer = response.choices[0].message.content
         # print(f"ได้รับคำตอบจาก GPT (ความยาว: {len(answer)} ตัวอักษร)")
+        
+        # 🆕 ตรวจสอบว่าคำตอบมาจาก MongoDB หรือไม่
+        answer_source_verified = verify_answer_source(answer, valid_retrieved_docs, question)
+        
+        # บันทึกข้อมูลแหล่งที่มาของคำตอบ
+        if answer_source_verified:
+            logger.info(f"✅ คำตอบถูกสร้างจากข้อมูล MongoDB: {len(valid_retrieved_docs)} เอกสาร, "
+                       f"ตรวจสอบแหล่งที่มา: ผ่าน")
+            print(f"✅ คำตอบมาจาก MongoDB: {len(valid_retrieved_docs)} เอกสาร")
+        else:
+            logger.warning(f"⚠️ คำตอบอาจไม่ได้มาจาก MongoDB เท่านั้น - คำถาม: {question[:50]}...")
+            print(f"⚠️ คำตอบอาจไม่ได้มาจาก MongoDB เท่านั้น - ควรตรวจสอบ")
         
         # ไม่ใช้ฟังก์ชันจัดรูปแบบเพื่อให้ GPT สร้างคำตอบแบบธรรมชาติ
         
@@ -1593,11 +2317,11 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         except Exception:
             answer = "ขออภัยค่ะ เกิดปัญหาในการประมวลผล กรุณาลองใหม่อีกครั้ง"
 
-    # แสดงรายงานบนเทอร์มินัลสำหรับ RAGAS
+    # แสดงรายงานบนเทอร์มินัลสำหรับ RAGAS (แสดงทั้งเอกสารที่ผ่านและไม่ผ่าน threshold)
     try:
         print_ragas_terminal_report(
             question=question,
-            retrieved_docs=retrieved_docs,
+            retrieved_docs=retrieved_docs,  # ส่งทั้งเอกสารทั้งหมดรวมถึงที่ต่ำกว่า threshold
             answer=answer,
             user_id=user_id,
         )
@@ -1684,4 +2408,5 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         pass
 
     # print(f"=== ส่งคำตอบให้ผู้ใช้: {user_id} ===\n")
+    return answer
     return answer

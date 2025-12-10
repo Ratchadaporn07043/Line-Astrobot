@@ -146,7 +146,7 @@ def get_embedding_model():
     """โหลด embedding model แบบ lazy loading"""
     if not hasattr(get_embedding_model, 'model'):
         print("🔄 Loading embedding model...")
-        get_embedding_model.model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+        get_embedding_model.model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
     return get_embedding_model.model
 
 def get_semantic_model():
@@ -163,17 +163,17 @@ def get_ocr_reader():
         get_ocr_reader.reader = easyocr.Reader(['en', 'th'], gpu=False, verbose=False)
     return get_ocr_reader.reader
 
-# 🆕 โหลด Image Embedding Model (CLIP) แบบ lazy loading
+# 🆕 โหลด Image Embedding Model แบบ lazy loading (ใช้โมเดลเดียวกับ text)
 def get_image_embedding_model():
-    """โหลด CLIP model สำหรับสร้าง image embeddings แบบ lazy loading"""
+    """โหลด embedding model สำหรับสร้าง image embeddings แบบ lazy loading (ใช้โมเดลเดียวกับ text)"""
     if not hasattr(get_image_embedding_model, 'model'):
         try:
-            print("🔄 Loading CLIP image embedding model...")
-            # ใช้ CLIP model จาก sentence-transformers
-            get_image_embedding_model.model = SentenceTransformer('clip-ViT-B-32', device="cpu")
-            print("✅ CLIP model loaded successfully")
+            print("🔄 Loading image embedding model...")
+            # ใช้โมเดลเดียวกับ text embedding
+            get_image_embedding_model.model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
+            print("✅ Image embedding model loaded successfully")
         except Exception as e:
-            print(f"⚠️ Failed to load CLIP model: {e}")
+            print(f"⚠️ Failed to load image embedding model: {e}")
             print("⚠️ Image embeddings will be disabled")
             get_image_embedding_model.model = None
     return get_image_embedding_model.model
@@ -386,13 +386,13 @@ def create_embeddings(text):
         print(f"❗ Error creating embeddings: {e}")
         return [0.0] * 384  # fallback vector
 
-# 🆕 สร้าง Image Embeddings
-def create_image_embeddings(image_bytes):
+# 🆕 สร้าง Image Embeddings (ใช้ text จาก OCR)
+def create_image_embeddings(text):
     """
-    สร้าง embeddings สำหรับรูปภาพด้วย CLIP model
+    สร้าง embeddings สำหรับรูปภาพโดยใช้ข้อความจาก OCR (ใช้โมเดลเดียวกับ text embedding)
     
     Args:
-        image_bytes: bytes ของรูปภาพ
+        text: ข้อความจาก OCR ของรูปภาพ
         
     Returns:
         list: image embedding vector หรือ None ถ้าไม่สามารถสร้างได้
@@ -403,11 +403,8 @@ def create_image_embeddings(image_bytes):
             print("   ⚠️ Image embedding model not available, skipping...")
             return None
         
-        # แปลง image bytes เป็น PIL Image
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # สร้าง embedding ด้วย CLIP
-        embedding = image_model.encode(image)
+        # สร้าง embedding จากข้อความ OCR ด้วยโมเดลเดียวกับ text
+        embedding = image_model.encode(text)
         return embedding.tolist()
         
     except Exception as e:
@@ -904,9 +901,9 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                         
                         print(f"   🖼️ Image {img_index + 1}: {len(improved_text)} ตัวอักษร (OCR: {len(ocr_text)} ตัวอักษร)")
                         
-                        # 🆕 สร้าง image embedding (ก่อนที่จะลบ image_bytes)
+                        # 🆕 สร้าง image embedding จากข้อความ OCR (ใช้โมเดลเดียวกับ text)
                         print(f"   🔄 กำลังสร้าง image embedding...")
-                        image_embedding = create_image_embeddings(image_bytes)
+                        image_embedding = create_image_embeddings(improved_text)
                         
                         # Create image chunk
                         image_chunk = {

@@ -10,7 +10,7 @@ import re
 # ใช้ฟังก์ชัน Retrieval จาก utils
 from .retrieval_utils import ask_question_to_rag, store_user_response, store_user_question, check_and_update_question_limit
 # ใช้ฟังก์ชัน Birth Date Parser
-from .birth_date_parser import extract_birth_date_from_message, generate_birth_chart_prediction
+from .birth_date_parser import extract_birth_date_from_message, generate_birth_chart_prediction, detect_zodiac_sign_in_message
 # ใช้ฟังก์ชัน Content Filter
 from .content_filter import check_content_safety
 
@@ -330,27 +330,23 @@ def generate_reply_message(event):
     if profile_status:
         return TextMessage(text=profile_status)
 
-    # ข้อความนี้เป็นทางลัด แต่ตอนนี้เราต้องการให้คำถามที่มีวันเกิดเรียก LLM เสมอเพื่อให้คำทำนายที่ครบถ้วน
-    # ดังนั้นเราจะลบทางลัดนี้ออกและให้ทุกคำถามที่มีวันเกิดเรียก LLM
-    # try:
-    #     if "ราศี" in user_text:
-    #         from .birth_date_parser import BirthDateParser
-    #         parser = BirthDateParser()
-    #         info = parser.extract_birth_info(user_text)
-    #         if info and info.get('date'):
-    #             chart = parser.generate_birth_chart_info(info['date'], info.get('time'), info.get('latitude', 13.7563), info.get('longitude', 100.5018))
-    #             if chart and chart.get('zodiac_sign'):
-    #                 local_reply = f"วันเกิด: {info['date']}\nราศีของคุณคือ ราศี{chart['zodiac_sign']}"
-    #                 # บันทึกคำถาม/คำตอบแบบย่อเพื่อบริบทต่อเนื่อง (ถ้าต่อกับ DB ได้)
-    #                 try:
-    #                     store_user_question(question=user_text, user_id=user_id, context_data={"birth_date": info['date']})
-    #                     store_user_response(question=user_text, answer=local_reply, user_id=user_id, response_type="local_zodiac", context_data={"zodiac_sign": chart['zodiac_sign'], "birth_date": info['date']})
-    #                 except Exception:
-    #                     pass
-    #                 log_pretty_answer(user_id, "local_zodiac", local_reply)
-    #                 return TextMessage(text=local_reply)
-    # except Exception as e:
-    #     logger.warning(f"Local zodiac fallback failed: {e}")
+    # ตรวจสอบว่ามีชื่อราศีในข้อความหรือไม่ (ก่อนตรวจสอบวันเกิด)
+    # ถ้ามีชื่อราศีชัดเจนและไม่มีวันเกิด ให้ตอบคำถามเกี่ยวกับราศีนั้นโดยตรง
+    detected_zodiac = detect_zodiac_sign_in_message(user_text)
+    birth_date = extract_birth_date_from_message(user_text)
+    
+    # ถ้าพบชื่อราศีแต่ไม่พบวันเกิด ให้สร้าง chart_info จากชื่อราศี
+    chart_info_for_zodiac = None
+    if detected_zodiac and not birth_date:
+        logger.info(f"พบชื่อราศีในข้อความ: {detected_zodiac['sign']} แต่ไม่พบวันเกิด - จะตอบคำถามเกี่ยวกับราศีโดยตรง")
+        from .birth_date_parser import BirthDateParser
+        # สร้าง chart_info จากชื่อราศีที่พบ
+        chart_info_for_zodiac = {
+            'zodiac_sign': detected_zodiac['sign'],
+            'zodiac_element': detected_zodiac['element'],
+            'zodiac_quality': detected_zodiac['quality'],
+            'zodiac_english': detected_zodiac['english_name']
+        }
 
     # ตรวจสอบจำนวนคำถามต่อเนื่อง (ไม่จำกัดจำนวนครั้ง)
     is_allowed, current_count, limit_message = check_and_update_question_limit(user_id)
@@ -411,7 +407,12 @@ def generate_reply_message(event):
                 )
         else:
             logger.info(f"กำลังประมวลผลคำถาม: {user_text}")
-            reply_text = ask_question_to_rag(user_text, user_id=user_id)
+            # ถ้ามี chart_info จากชื่อราศี ให้ส่งไปกับคำถาม
+            if chart_info_for_zodiac:
+                logger.info(f"ส่ง chart_info จากชื่อราศี: ราศี{chart_info_for_zodiac['zodiac_sign']}")
+                reply_text = ask_question_to_rag(user_text, user_id=user_id, provided_chart_info=chart_info_for_zodiac)
+            else:
+                reply_text = ask_question_to_rag(user_text, user_id=user_id)
             # ป้องกันกรณีที่คำตอบไม่ใช่สตริง หรือเป็น None
             if not isinstance(reply_text, str):
                 logger.warning(f"reply_text is not str (type={type(reply_text)}), coercing to string")

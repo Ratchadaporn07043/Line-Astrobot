@@ -453,6 +453,7 @@ models/
 *.backup
 *.bak
 *.old
+.env.backup.*
 
 # IDE specific
 .vscode/
