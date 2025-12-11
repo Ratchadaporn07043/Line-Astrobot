@@ -1,21 +1,27 @@
 import os
 import io
 import base64
+import tempfile
 import fitz  # PyMuPDF
 import pdfplumber
 from PIL import Image
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from langchain.schema import Document
-from sentence_transformers import SentenceTransformer
-import torch
-import easyocr
-from openai import OpenAI
 from datetime import datetime
 import json
 import gc
 import psutil
 import re
+from sentence_transformers import SentenceTransformer
+
+# 🆕 เพิ่ม camelot สำหรับ extract ตาราง
+try:
+    import camelot
+    CAMELOT_AVAILABLE = True
+    print("✅ Camelot loaded successfully")
+except ImportError:
+    CAMELOT_AVAILABLE = False
+    print("⚠️ Camelot not available, using pdfplumber for table extraction")
 
 # 🆕 เพิ่ม PyThaiNLP สำหรับปรับปรุง OCR
 try:
@@ -41,8 +47,6 @@ load_dotenv(dotenv_path)
 # ✅ ตัวแปรระบบ
 PDF_PATH = "data/attention.pdf"
 MONGO_URL = os.getenv("MONGO_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SUMMARY_DB_NAME = "astrobot_summary"  # สำหรับเก็บข้อมูลที่ summary และ summary embedding แล้ว
 ORIGINAL_DB_NAME = "astrobot_original"  # สำหรับเก็บไฟล์ต้นฉบับที่ extract แล้ว
 
 # ✅ ตัวแปรระบบ - Collection Names
@@ -50,11 +54,6 @@ ORIGINAL_DB_NAME = "astrobot_original"  # สำหรับเก็บไฟ�
 ORIGINAL_TEXT_COLLECTION = "original_text_chunks"
 ORIGINAL_IMAGE_COLLECTION = "original_image_chunks"
 ORIGINAL_TABLE_COLLECTION = "original_table_chunks"
-
-# สำหรับข้อมูลที่ประมวลผลแล้ว (SUMMARY_DB_NAME)
-PROCESSED_TEXT_COLLECTION = "processed_text_chunks"
-PROCESSED_IMAGE_COLLECTION = "processed_image_chunks"
-PROCESSED_TABLE_COLLECTION = "processed_table_chunks"
 
 # ✅ ฟังก์ชันแปลง bbox เป็น format ที่ MongoDB สามารถ encode ได้
 def convert_bbox_to_mongodb_format(bbox):
@@ -91,19 +90,100 @@ def check_memory():
     if memory.percent > 80:
         print("⚠️ High memory usage, running garbage collection...")
         gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+# 🆕 Dictionary สำหรับคำที่พบบ่อยใน OCR ที่ถูกแยกผิด
+COMMON_OCR_CORRECTIONS = {
+    'สญ ลก ษณ์': 'สัญลักษณ์',
+    'สญลกษณ์': 'สัญลักษณ์',
+    'สญ ลก ษณ': 'สัญลักษณ์',
+    'สญลกษณ': 'สัญลักษณ์',
+    'ตลุ': 'ตุลย์',
+    'พิจิกิ': 'พิจิก',
+    'พิ จิ กิ': 'พิจิก',
+    'มถิ นุ': 'มิถุน',
+    'มถินุ': 'มิถุน',
+    'กรก ฏ': 'กรกฎ',
+    'กรกฏ': 'กรกฎ',
+    'มกร': 'มกร',
+    'มิถุน': 'มิถุน',
+    'พฤษภ': 'พฤษภ',
+    'กรกฎ': 'กรกฎ',
+    'ธนู': 'ธนู',
+    'เมษ': 'เมษ',
+}
 
 # 🆕 ฟังก์ชันปรับปรุงข้อความไทยจาก OCR ด้วย PyThaiNLP
 def improve_thai_ocr_text(ocr_text):
     """
     ปรับปรุงข้อความไทยจาก OCR ด้วย PyThaiNLP
+    - Normalize ข้อความ
+    - แก้ไขคำที่ถูกแยกผิดด้วย dictionary
+    - แก้ไขการเว้นวรรค
+    - แก้ไขคำผิดด้วย spell checker
+    - แบ่งคำด้วย word tokenizer
     """
     if not PYTHAINLP_AVAILABLE or not ocr_text.strip():
         return ocr_text
     
     try:
-        # ทำความสะอาดข้อความ
+        # ทำความสะอาดข้อความเบื้องต้น
         text = ocr_text.strip()
+        
+        # 🆕 แก้ไขคำที่พบบ่อยใน OCR ที่ถูกแยกผิด (ทำก่อน normalize)
+        for wrong, correct in COMMON_OCR_CORRECTIONS.items():
+            # แทนที่ทั้งแบบมีช่องว่างและไม่มีช่องว่าง
+            text = text.replace(wrong, correct)
+            # แทนที่แบบไม่มีช่องว่าง (กรณีที่ถูกแยกเป็น "สญลกษณ์")
+            text = text.replace(wrong.replace(' ', ''), correct)
+        
+        # 🆕 รวมคำที่ถูกแยกด้วยช่องว่าง (เช่น "สญ ลก ษณ์" -> "สัญลักษณ์")
+        # หาคำที่ถูกแยกด้วยช่องว่าง (คำไทยที่สั้นๆ หลายคำติดกัน)
+        
+        # Pattern 1: คำไทย 1-3 ตัว + ช่องว่าง + คำไทย 1-3 ตัว + ช่องว่าง + คำไทย 1-3 ตัว (3 คำ)
+        thai_word_pattern_3 = r'([ก-๙]{1,3})\s+([ก-๙]{1,3})\s+([ก-๙]{1,3})'
+        matches_3 = list(re.finditer(thai_word_pattern_3, text))
+        matches_3.sort(key=lambda m: m.end() - m.start(), reverse=True)
+        
+        # Pattern 2: คำไทย 1-3 ตัว + ช่องว่าง + คำไทย 1-3 ตัว (2 คำ)
+        thai_word_pattern_2 = r'([ก-๙]{1,3})\s+([ก-๙]{1,3})'
+        matches_2 = list(re.finditer(thai_word_pattern_2, text))
+        matches_2.sort(key=lambda m: m.end() - m.start(), reverse=True)
+        
+        replacements = []
+        
+        # ประมวลผลคำที่ถูกแยกเป็น 3 คำก่อน
+        for match in matches_3:
+            combined = match.group(1) + match.group(2) + match.group(3)
+            if combined in COMMON_OCR_CORRECTIONS:
+                replacements.append((match.group(0), COMMON_OCR_CORRECTIONS[combined]))
+            elif combined in COMMON_OCR_CORRECTIONS.values():
+                replacements.append((match.group(0), combined))
+            elif len(combined) >= 4:
+                replacements.append((match.group(0), combined))
+        
+        # ประมวลผลคำที่ถูกแยกเป็น 2 คำ
+        for match in matches_2:
+            combined = match.group(1) + match.group(2)
+            if combined in COMMON_OCR_CORRECTIONS:
+                replacements.append((match.group(0), COMMON_OCR_CORRECTIONS[combined]))
+            elif combined in COMMON_OCR_CORRECTIONS.values():
+                replacements.append((match.group(0), combined))
+            elif len(combined) >= 3:
+                replacements.append((match.group(0), combined))
+        
+        # แทนที่คำที่ถูกแยก (จากหลังไปหน้าเพื่อไม่ให้ตำแหน่งเปลี่ยน)
+        for old, new in reversed(replacements):
+            text = text.replace(old, new, 1)  # แทนที่ครั้งเดียว
+        
+        # 🆕 แก้ไขคำที่พบบ่อยอีกครั้ง (หลังจากรวมคำแล้ว)
+        for wrong, correct in COMMON_OCR_CORRECTIONS.items():
+            text = text.replace(wrong, correct)
+        
+        # 🆕 Normalize ข้อความด้วย PyThaiNLP (แก้ไขตัวอักษรพิเศษ, วรรณยุกต์)
+        try:
+            text = normalize(text)
+        except:
+            pass  # ถ้า normalize ไม่ได้ ให้ข้าม
         
         # แก้ไขการเว้นวรรคที่ผิด
         text = re.sub(r'([ก-๙])([A-Za-z])', r'\1 \2', text)  # เว้นวรรคระหว่างไทย-อังกฤษ
@@ -114,19 +194,37 @@ def improve_thai_ocr_text(ocr_text):
         # แก้ไขการเว้นวรรคที่ซ้ำ
         text = re.sub(r'\s+', ' ', text)
         
-        # แบ่งคำด้วย PyThaiNLP
-        words = word_tokenize(text, engine='newmm')
+        # แบ่งคำด้วย PyThaiNLP (ใช้ newmm engine สำหรับความแม่นยำ)
+        try:
+            words = word_tokenize(text, engine='newmm')
+        except:
+            # Fallback: แบ่งคำแบบง่ายๆ ถ้า word_tokenize ไม่ได้
+            words = text.split()
         
-        # แก้ไขคำผิดด้วย PyThaiNLP
+        # แก้ไขคำผิดด้วย PyThaiNLP spell checker
         corrected_words = []
         for word in words:
-            if len(word) > 2 and word.isalpha():  # แก้ไขเฉพาะคำที่มีความยาวมากกว่า 2 ตัวอักษร
+            # ตรวจสอบว่าเป็นคำไทยหรือไม่ (มีตัวอักษรไทย)
+            has_thai = bool(re.search(r'[ก-๙]', word))
+            
+            if has_thai and len(word) > 2 and word.isalpha():
+                # แก้ไขเฉพาะคำไทยที่มีความยาวมากกว่า 2 ตัวอักษร
                 try:
                     corrected = correct(word)
-                    corrected_words.append(corrected if corrected else word)
-                except:
+                    # ใช้คำที่แก้ไขแล้วถ้าไม่ใช่ None และไม่เหมือนเดิมมากเกินไป
+                    if corrected and corrected != word:
+                        # ตรวจสอบว่าคำที่แก้ไขแล้วมีความยาวใกล้เคียงกับคำเดิม
+                        if abs(len(corrected) - len(word)) <= 2:
+                            corrected_words.append(corrected)
+                        else:
+                            corrected_words.append(word)
+                    else:
+                        corrected_words.append(word)
+                except Exception as e:
+                    # ถ้าแก้ไขไม่ได้ ให้ใช้คำเดิม
                     corrected_words.append(word)
             else:
+                # ไม่ใช่คำไทย หรือเป็นตัวเลข/สัญลักษณ์ ให้เก็บไว้ตามเดิม
                 corrected_words.append(word)
         
         # รวมคำกลับเป็นประโยค
@@ -141,45 +239,162 @@ def improve_thai_ocr_text(ocr_text):
         print(f"⚠️ Error in Thai text improvement: {e}")
         return ocr_text
 
-# ✅ โหลดโมเดลแบบ lazy loading
+# 🆕 ฟังก์ชันปรับปรุงข้อความในตารางด้วย PyThaiNLP
+def improve_thai_table_text(table_text):
+    """
+    ปรับปรุงข้อความในตารางด้วย PyThaiNLP
+    - แยกแต่ละเซลล์ในตาราง (แยกด้วย " | ")
+    - ปรับปรุงข้อความในแต่ละเซลล์
+    - รักษาโครงสร้างตาราง (แถวและคอลัมน์)
+    """
+    if not PYTHAINLP_AVAILABLE or not table_text.strip():
+        return table_text
+    
+    try:
+        # แยกตารางเป็นแถว
+        rows = table_text.split('\n')
+        improved_rows = []
+        
+        for row in rows:
+            if not row.strip():
+                improved_rows.append(row)
+                continue
+            
+            # แยกเซลล์ด้วย " | "
+            cells = row.split(' | ')
+            improved_cells = []
+            
+            for cell in cells:
+                if cell.strip():
+                    # ปรับปรุงข้อความในแต่ละเซลล์
+                    improved_cell = improve_thai_ocr_text(cell.strip())
+                    improved_cells.append(improved_cell)
+                else:
+                    improved_cells.append(cell)
+            
+            # รวมเซลล์กลับเป็นแถว
+            improved_row = ' | '.join(improved_cells)
+            improved_rows.append(improved_row)
+        
+        # รวมแถวกลับเป็นตาราง
+        improved_table = '\n'.join(improved_rows)
+        
+        return improved_table
+        
+    except Exception as e:
+        print(f"⚠️ Error in Thai table text improvement: {e}")
+        return table_text
+
+def get_ocr_reader():
+    """โหลด OCR reader แบบ lazy loading (ใช้ Typhoon OCR)"""
+    if not hasattr(get_ocr_reader, 'reader'):
+        print("🔄 Loading Typhoon OCR...")
+        try:
+            from typhoon_ocr import ocr_document
+            # ตรวจสอบ API key
+            api_key = os.getenv("TYPHOON_OCR_API_KEY")
+            if not api_key:
+                print("⚠️ TYPHOON_OCR_API_KEY not found in environment variables")
+                print("   Falling back to EasyOCR. Set TYPHOON_OCR_API_KEY to use Typhoon OCR")
+                raise ValueError("API key not found")
+            
+            # ยืนยันว่า API key ถูกโหลดแล้ว (ไม่แสดงค่าเพื่อความปลอดภัย)
+            print(f"✅ TYPHOON_OCR_API_KEY loaded (length: {len(api_key)} characters)")
+            
+            get_ocr_reader.ocr_document = ocr_document
+            get_ocr_reader.reader = "typhoon_ocr"  # ใช้เป็น flag
+            print("✅ Typhoon OCR loaded successfully")
+        except (ImportError, ValueError) as e:
+            print(f"⚠️ Typhoon OCR not available ({e}), falling back to EasyOCR")
+            import easyocr
+            get_ocr_reader.reader = easyocr.Reader(['en', 'th'], gpu=False, verbose=False)
+            get_ocr_reader.ocr_document = None
+    return get_ocr_reader.reader
+
+def perform_ocr_on_image_bytes(image_bytes):
+    """
+    ทำ OCR บน image bytes โดยใช้ Typhoon OCR หรือ EasyOCR (fallback)
+    
+    Args:
+        image_bytes: bytes ของรูปภาพ
+        
+    Returns:
+        str: ข้อความที่ได้จาก OCR
+    """
+    reader = get_ocr_reader()
+    
+    # ตรวจสอบว่าใช้ Typhoon OCR หรือ EasyOCR
+    if reader == "typhoon_ocr" and hasattr(get_ocr_reader, 'ocr_document'):
+        try:
+            # สร้างไฟล์ชั่วคราว
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+                tmp_file.write(image_bytes)
+                tmp_path = tmp_file.name
+            
+            try:
+                # เรียกใช้ Typhoon OCR
+                ocr_document = get_ocr_reader.ocr_document
+                markdown_text = ocr_document(pdf_or_image_path=tmp_path)
+                
+                # แปลง markdown เป็น plain text (ลบ markdown syntax)
+                # ลบ markdown headers, bold, italic, etc.
+                text = re.sub(r'#+\s*', '', markdown_text)  # ลบ headers
+                text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # ลบ bold
+                text = re.sub(r'\*([^*]+)\*', r'\1', text)  # ลบ italic
+                text = re.sub(r'`([^`]+)`', r'\1', text)  # ลบ code
+                text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # ลบ links
+                text = re.sub(r'\n+', ' ', text)  # แทนที่ newlines ด้วย space
+                text = re.sub(r'\s+', ' ', text).strip()  # ลบ spaces ซ้ำ
+                
+                return text
+            finally:
+                # ลบไฟล์ชั่วคราว
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        except Exception as e:
+            print(f"⚠️ Error using Typhoon OCR: {e}, falling back to EasyOCR")
+            # Fallback to EasyOCR
+            import easyocr
+            easyocr_reader = easyocr.Reader(['en', 'th'], gpu=False, verbose=False)
+            ocr_results = easyocr_reader.readtext(image_bytes)
+            ocr_text = " ".join([result[1] for result in ocr_results if result[2] > 0.3])
+            return ocr_text
+    else:
+        # ใช้ EasyOCR (fallback)
+        ocr_results = reader.readtext(image_bytes)
+        ocr_text = " ".join([result[1] for result in ocr_results if result[2] > 0.3])
+        return ocr_text
+
+# ✅ ฟังก์ชันโหลด embedding model แบบ lazy loading
 def get_embedding_model():
     """โหลด embedding model แบบ lazy loading"""
     if not hasattr(get_embedding_model, 'model'):
         print("🔄 Loading embedding model...")
         get_embedding_model.model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
+        print("✅ Embedding model loaded successfully")
     return get_embedding_model.model
 
-def get_semantic_model():
-    """โหลด semantic model แบบ lazy loading"""
-    if not hasattr(get_semantic_model, 'model'):
-        print("🔄 Loading semantic model...")
-        get_semantic_model.model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
-    return get_semantic_model.model
-
-def get_ocr_reader():
-    """โหลด OCR reader แบบ lazy loading"""
-    if not hasattr(get_ocr_reader, 'reader'):
-        print(" Loading OCR reader...")
-        get_ocr_reader.reader = easyocr.Reader(['en', 'th'], gpu=False, verbose=False)
-    return get_ocr_reader.reader
-
-# 🆕 โหลด Image Embedding Model แบบ lazy loading (ใช้โมเดลเดียวกับ text)
-def get_image_embedding_model():
-    """โหลด embedding model สำหรับสร้าง image embeddings แบบ lazy loading (ใช้โมเดลเดียวกับ text)"""
-    if not hasattr(get_image_embedding_model, 'model'):
-        try:
-            print("🔄 Loading image embedding model...")
-            # ใช้โมเดลเดียวกับ text embedding
-            get_image_embedding_model.model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
-            print("✅ Image embedding model loaded successfully")
-        except Exception as e:
-            print(f"⚠️ Failed to load image embedding model: {e}")
-            print("⚠️ Image embeddings will be disabled")
-            get_image_embedding_model.model = None
-    return get_image_embedding_model.model
-
-# OpenAI client
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# ✅ ฟังก์ชันสร้าง embedding สำหรับข้อความ
+def create_text_embedding(text):
+    """
+    สร้าง embedding สำหรับข้อความ
+    
+    Args:
+        text: ข้อความที่ต้องการสร้าง embedding
+        
+    Returns:
+        list: embedding vector (list of floats) หรือ None ถ้าเกิดข้อผิดพลาด
+    """
+    if not text or not text.strip():
+        return None
+    
+    try:
+        model = get_embedding_model()
+        embedding = model.encode(text, convert_to_numpy=True).tolist()
+        return embedding
+    except Exception as e:
+        print(f"⚠️ Error creating embedding: {e}")
+        return None
 
 # ✅ อ่านข้อความจาก PDF ด้วย PyMuPDF
 def extract_text_with_pymupdf(path):
@@ -210,13 +425,11 @@ def extract_images_with_ocr(path):
     """
     แปลงรูปภาพใน PDF เป็นข้อความด้วย OCR + PyThaiNLP
     """
-    print(f"กำลังแปลงรูปภาพเป็นข้อความจาก: {path}")
+    print(f"🖼️ กำลังแปลงรูปภาพเป็นข้อความจาก: {path}")
     images_data = []
     doc = fitz.open(path)
     
     try:
-        ocr_reader = get_ocr_reader()
-        
         for page_num, page in enumerate(doc):
             images = page.get_images(full=True)
             print(f"หน้า {page_num + 1}: {len(images)} รูป")
@@ -241,9 +454,8 @@ def extract_images_with_ocr(path):
                         print(f"⚠️ ข้ามรูปเล็ก {img_index + 1} ({width}x{height})")
                         continue
                     
-                    # OCR
-                    ocr_results = ocr_reader.readtext(image_bytes)
-                    ocr_text = " ".join([result[1] for result in ocr_results if result[2] > 0.3])  # ลด confidence threshold
+                    # OCR (ใช้ Typhoon OCR)
+                    ocr_text = perform_ocr_on_image_bytes(image_bytes)
                     
                     if ocr_text.strip():
                         # 🆕 ปรับปรุงข้อความด้วย PyThaiNLP
@@ -262,7 +474,7 @@ def extract_images_with_ocr(path):
                         print(f"✅ รูป {img_index + 1}: {len(improved_text)} ตัวอักษร")
                     
                     # ล้าง memory
-                    del image, image_bytes, ocr_results
+                    del image, image_bytes
                     
                 except Exception as e:
                     print(f"❗ Error processing image {img_index + 1} on page {page_num + 1}: {e}")
@@ -282,12 +494,96 @@ def extract_images_with_ocr(path):
     
     return images_data
 
-# ✅ แปลงตารางเป็นข้อความด้วย pdfplumber
+# 🆕 แปลงตารางเป็นข้อความด้วย camelot + PyThaiNLP
+def extract_tables_with_camelot(path):
+    """
+    แปลงตารางใน PDF เป็นข้อความด้วย camelot + PyThaiNLP
+    - ใช้ camelot เพื่อ extract ตาราง (แม่นยำกว่า pdfplumber)
+    - ใช้ PyThaiNLP ปรับปรุงข้อความ
+    """
+    print(f"📊 กำลังแปลงตารางเป็นข้อความด้วย Camelot จาก: {path}")
+    tables_data = []
+    
+    if not CAMELOT_AVAILABLE:
+        print("⚠️ Camelot not available, falling back to pdfplumber")
+        return extract_tables_with_pdfplumber(path)
+    
+    try:
+        # ใช้ camelot extract ตารางจาก PDF
+        # flavor='lattice' สำหรับตารางที่มีเส้นขอบ, 'stream' สำหรับตารางที่ไม่มีเส้นขอบ
+        print("🔄 กำลัง extract ตารางด้วย Camelot...")
+        tables = camelot.read_pdf(path, pages='all', flavor='lattice')
+        
+        print(f"✅ พบ {len(tables)} ตาราง")
+        
+        for table_index, table in enumerate(tables):
+            try:
+                # แปลงตารางเป็น list of lists (ไม่ใช้ pandas)
+                # camelot table.df เป็น DataFrame แต่เราจะแปลงเป็น list โดยใช้ .values.tolist()
+                try:
+                    # camelot ใช้ pandas DataFrame อยู่แล้ว แต่เราไม่ต้อง import pandas
+                    table_data = table.df.values.tolist()
+                except:
+                    # Fallback: แปลงเป็น list แบบง่ายๆ
+                    table_data = [[str(cell) for cell in row] for row in table.df.values] if hasattr(table.df, 'values') else []
+                
+                # 🆕 ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
+                table_text = ""
+                for row in table_data:
+                    if row:
+                        # ปรับปรุงข้อความในแต่ละเซลล์
+                        improved_cells = []
+                        for cell in row:
+                            cell_str = str(cell).strip() if cell is not None and str(cell).strip() else ""
+                            if cell_str and PYTHAINLP_AVAILABLE:
+                                improved_cell = improve_thai_ocr_text(cell_str)
+                                improved_cells.append(improved_cell)
+                            else:
+                                improved_cells.append(cell_str)
+                        
+                        row_text = " | ".join(improved_cells)
+                        if row_text.strip():
+                            table_text += row_text + "\n"
+                
+                if table_text.strip():
+                    # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP (อีกครั้งเพื่อปรับปรุงโครงสร้าง)
+                    improved_table_text = improve_thai_table_text(table_text.strip())
+                    
+                    # ดึงข้อมูลหน้า (camelot ใช้ 1-based page numbers)
+                    page_num = table.page if hasattr(table, 'page') else table_index + 1
+                    
+                    table_info = {
+                        "page": page_num,
+                        "table_index": table_index + 1,
+                        "original_text": table_text.strip(),
+                        "improved_text": improved_table_text,
+                        "text": improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
+                        "accuracy": float(table.accuracy) if hasattr(table, 'accuracy') else None,
+                        "bbox": table._bbox if hasattr(table, '_bbox') else None
+                    }
+                    tables_data.append(table_info)
+                    print(f"   ✅ ตาราง {table_index + 1} (หน้า {page_num}): {len(improved_table_text)} ตัวอักษร")
+                
+            except Exception as e:
+                print(f"   ⚠️ Error processing table {table_index + 1}: {e}")
+                continue
+        
+        # ตรวจสอบ memory
+        check_memory()
+                    
+    except Exception as e:
+        print(f"❗ Error extracting tables with Camelot: {e}")
+        print("   Falling back to pdfplumber...")
+        return extract_tables_with_pdfplumber(path)
+    
+    return tables_data
+
+# ✅ แปลงตารางเป็นข้อความด้วย pdfplumber (fallback)
 def extract_tables_with_pdfplumber(path):
     """
-    แปลงตารางใน PDF เป็นข้อความด้วย pdfplumber
+    แปลงตารางใน PDF เป็นข้อความด้วย pdfplumber (fallback)
     """
-    print(f" กำลังแปลงตารางเป็นข้อความจาก: {path}")
+    print(f"📊 กำลังแปลงตารางเป็นข้อความด้วย pdfplumber จาก: {path}")
     tables_data = []
     
     try:
@@ -304,10 +600,15 @@ def extract_tables_with_pdfplumber(path):
                                 table_text += row_text + "\n"
                         
                         if table_text.strip():
+                            # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
+                            improved_table_text = improve_thai_table_text(table_text.strip())
+                            
                             table_info = {
                                 "page": page_num + 1,
                                 "table_index": table_index + 1,
-                                "text": table_text.strip()
+                                "original_text": table_text.strip(),
+                                "improved_text": improved_table_text,
+                                "text": improved_table_text  # ใช้ข้อความที่ปรับปรุงแล้ว
                             }
                             tables_data.append(table_info)
                 
@@ -320,150 +621,11 @@ def extract_tables_with_pdfplumber(path):
     
     return tables_data
 
-# ✅ Semantic Chunking ด้วย Potion Model
-def semantic_chunking_with_potion(text, content_type, chunk_size=1000, overlap=200):
-    """
-    แบ่งข้อความด้วย Semantic Chunking โดยใช้ Potion Model
-    """
-    print(f"🧠 เริ่ม Semantic Chunking สำหรับ {content_type.upper()}")
-    
-    try:
-        semantic_model = get_semantic_model()
-        
-        # แบ่งข้อความเป็นประโยค
-        sentences = text.split('. ')
-        if len(sentences) <= 1:
-            return [{"text": text, "type": content_type, "chunk_id": 0}]
-        
-        # จำกัดจำนวนประโยคเพื่อประหยัด memory
-        if len(sentences) > 500:
-            sentences = sentences[:500]
-            print(f"⚠️ จำกัดที่ 500 ประโยคเพื่อประหยัด memory")
-        
-        # สร้าง embeddings สำหรับประโยค
-        sentence_embeddings = semantic_model.encode(sentences)
-        
-        # คำนวณความคล้ายคลึงระหว่างประโยค
-        chunks = []
-        current_chunk = []
-        current_length = 0
-        
-        for i, sentence in enumerate(sentences):
-            current_chunk.append(sentence)
-            current_length += len(sentence)
-            
-            # ตรวจสอบว่าควรแบ่ง chunk หรือไม่
-            if current_length >= chunk_size or i == len(sentences) - 1:
-                chunk_text = '. '.join(current_chunk)
-                chunks.append({
-                    "text": chunk_text,
-                    "type": content_type,
-                    "chunk_id": len(chunks)
-                })
-                current_chunk = []
-                current_length = 0
-        
-        # ล้าง memory
-        del sentence_embeddings, sentences
-        check_memory()
-        
-        return chunks
-        
-    except Exception as e:
-        print(f"❗ Error in semantic chunking: {e}")
-        # Fallback: แบ่งแบบธรรมดา
-        return [{"text": text, "type": content_type, "chunk_id": 0}]
-
-# ✅ สร้าง Embeddings
-def create_embeddings(text):
-    """
-    สร้าง embeddings สำหรับข้อความ
-    """
-    try:
-        embedding_model = get_embedding_model()
-        return embedding_model.encode(text).tolist()
-    except Exception as e:
-        print(f"❗ Error creating embeddings: {e}")
-        return [0.0] * 384  # fallback vector
-
-# 🆕 สร้าง Image Embeddings (ใช้ text จาก OCR)
-def create_image_embeddings(text):
-    """
-    สร้าง embeddings สำหรับรูปภาพโดยใช้ข้อความจาก OCR (ใช้โมเดลเดียวกับ text embedding)
-    
-    Args:
-        text: ข้อความจาก OCR ของรูปภาพ
-        
-    Returns:
-        list: image embedding vector หรือ None ถ้าไม่สามารถสร้างได้
-    """
-    try:
-        image_model = get_image_embedding_model()
-        if image_model is None:
-            print("   ⚠️ Image embedding model not available, skipping...")
-            return None
-        
-        # สร้าง embedding จากข้อความ OCR ด้วยโมเดลเดียวกับ text
-        embedding = image_model.encode(text)
-        return embedding.tolist()
-        
-    except Exception as e:
-        print(f"   ⚠️ Error creating image embeddings: {e}")
-        return None
-
-# ✅ สรุปข้อความด้วย OpenAI
-def summarize_with_openai(text, content_type, timeout=30, max_retries=3):
-    """
-    สรุปข้อความด้วย OpenAI GPT
-    
-    Args:
-        text: ข้อความที่ต้องการสรุป
-        content_type: ประเภทเนื้อหา (text/image/table)
-        timeout: ระยะเวลารอสูงสุด (วินาที)
-        max_retries: จำนวนครั้งที่ลองใหม่ถ้าเกิด error
-    """
-    for attempt in range(max_retries):
-        try:
-            prompt = f"""
-            สรุปเนื้อหาต่อไปนี้ให้กระชับและเข้าใจง่าย (ภาษาไทย):
-            
-            ประเภทเนื้อหา: {content_type}
-            เนื้อหา: {text[:2000]}...
-            
-            กรุณาสรุปให้ไม่เกิน 3 ประโยค
-            """
-            
-            # เพิ่ม timeout และ error handling
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=150,
-                temperature=0.7,
-                timeout=timeout  # เพิ่ม timeout
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            error_msg = str(e)
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2  # Exponential backoff: 2s, 4s, 6s
-                print(f"   ⚠️ Error in summarization (attempt {attempt + 1}/{max_retries}): {error_msg[:100]}")
-                print(f"   ⏳ รอ {wait_time} วินาที แล้วลองใหม่...")
-                import time
-                time.sleep(wait_time)
-            else:
-                print(f"   ❗ Error in summarization after {max_retries} attempts: {error_msg[:100]}")
-                # Fallback: ใช้ข้อความต้นฉบับที่ตัดแล้ว
-                return text[:200] + "..." if len(text) > 200 else text
-    
-    # Fallback ถ้า retry ทั้งหมดล้มเหลว
-    return text[:200] + "..." if len(text) > 200 else text
-
-# ✅ บันทึกข้อมูลต้นฉบับลง MongoDB (ไม่มี embeddings และ summary)
+# ✅ บันทึกข้อมูลต้นฉบับลง MongoDB
 def store_original_data_in_mongodb(chunks, collection_name):
     """
-    บันทึกข้อมูลต้นฉบับลง ORIGINAL_DB_NAME (ไม่มี embeddings และ summary)
+    บันทึกข้อมูลต้นฉบับลง ORIGINAL_DB_NAME
+    🆕 เพิ่มการสร้าง embeddings ก่อนบันทึก
     """
     try:
         # ลองเชื่อมต่อ MongoDB Atlas
@@ -476,7 +638,7 @@ def store_original_data_in_mongodb(chunks, collection_name):
         
         # ใช้ ORIGINAL_DB_NAME สำหรับข้อมูลต้นฉบับ
         db_name = ORIGINAL_DB_NAME
-        print(f"📊 ใช้ Database: {db_name} (Original - ไม่มี embeddings/summary)")
+        print(f"📊 ใช้ Database: {db_name} (Original)")
         
         db = client[db_name]
         collection = db[collection_name]
@@ -484,7 +646,8 @@ def store_original_data_in_mongodb(chunks, collection_name):
         # ลบข้อมูลเก่า
         collection.delete_many({})
         
-        # บันทึกข้อมูลต้นฉบับ (ไม่มี embeddings และ summary)
+        # บันทึกข้อมูลต้นฉบับ
+        print(f"🔄 กำลังสร้าง embeddings สำหรับ {len(chunks)} chunks...")
         for i, chunk in enumerate(chunks):
             print(f"📝 กำลังบันทึกข้อมูลต้นฉบับ chunk {i+1}/{len(chunks)}...")
             
@@ -492,14 +655,22 @@ def store_original_data_in_mongodb(chunks, collection_name):
             original_chunk = chunk.copy()
             original_chunk["created_at"] = datetime.now()
             
-            # ไม่เพิ่ม embeddings และ summary
+            # 🆕 สร้าง embedding จาก text
+            text_content = original_chunk.get('text', '')
+            if text_content:
+                embedding = create_text_embedding(text_content)
+                if embedding:
+                    original_chunk['embeddings'] = embedding
+                else:
+                    print(f"   ⚠️ ไม่สามารถสร้าง embedding สำหรับ chunk {i+1} ได้")
+            
             collection.insert_one(original_chunk)
             
             # ตรวจสอบ memory ทุก 5 chunks
             if i % 5 == 0:
                 check_memory()
         
-        print(f"✅ บันทึกข้อมูลต้นฉบับ {len(chunks)} chunks ลง {collection_name}")
+        print(f"✅ บันทึกข้อมูลต้นฉบับ {len(chunks)} chunks ลง {collection_name} (พร้อม embeddings)")
         client.close()
         
     except Exception as e:
@@ -509,65 +680,10 @@ def store_original_data_in_mongodb(chunks, collection_name):
         # Fallback: บันทึกลงไฟล์ JSON
         store_original_to_json(chunks, collection_name)
 
-# ✅ บันทึกข้อมูลที่ประมวลผลแล้วลง MongoDB (มี embeddings และ summary)
-def store_processed_data_in_mongodb(chunks, collection_name):
-    """
-    บันทึกข้อมูลที่ประมวลผลแล้วลง SUMMARY_DB_NAME (มี embeddings และ summary)
-    """
-    try:
-        # ลองเชื่อมต่อ MongoDB Atlas
-        print(f"🔗 กำลังเชื่อมต่อ MongoDB Atlas...")
-        client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
-        
-        # ทดสอบการเชื่อมต่อ
-        client.admin.command('ping')
-        print(f"✅ เชื่อมต่อ MongoDB Atlas สำเร็จ")
-        
-        # ใช้ SUMMARY_DB_NAME สำหรับข้อมูลที่ประมวลผลแล้ว
-        db_name = SUMMARY_DB_NAME
-        print(f"📊 ใช้ Database: {db_name} (Processed - มี summary embeddings/summary)")
-        
-        db = client[db_name]
-        collection = db[collection_name]
-        
-        # ลบข้อมูลเก่า
-        collection.delete_many({})
-        
-        # บันทึกข้อมูลที่ประมวลผลแล้ว (มี summary embeddings และ summary)
-        for i, chunk in enumerate(chunks):
-            print(f"📝 กำลังประมวลผล chunk {i+1}/{len(chunks)}...")
-            
-            # สร้างสำเนาของ chunk และเพิ่มข้อมูลที่ประมวลผลแล้ว
-            processed_chunk = chunk.copy()
-            processed_chunk["created_at"] = datetime.now()
-            
-            # สร้าง summary ก่อน
-            summary_text = summarize_with_openai(chunk["text"], chunk["type"])
-            processed_chunk["summary"] = summary_text
-            
-            # สร้าง embeddings จาก summary แทน text ต้นฉบับ
-            processed_chunk["embeddings"] = create_embeddings(summary_text)
-            
-            collection.insert_one(processed_chunk)
-            
-            # ตรวจสอบ memory ทุก 3 chunks
-            if i % 3 == 0:
-                check_memory()
-        
-        print(f"✅ บันทึกข้อมูลที่ประมวลผลแล้ว {len(chunks)} chunks ลง {collection_name}")
-        client.close()
-        
-    except Exception as e:
-        print(f"❗ MongoDB Atlas connection failed: {e}")
-        print(f"💾 บันทึกลงไฟล์ JSON แทน...")
-        
-        # Fallback: บันทึกลงไฟล์ JSON
-        store_processed_to_json(chunks, collection_name)
-
 # ✅ บันทึกข้อมูลต้นฉบับลงไฟล์ JSON (fallback)
 def store_original_to_json(chunks, collection_name):
     """
-    บันทึกข้อมูลต้นฉบับลงไฟล์ JSON เป็น fallback (ไม่มี embeddings และ summary)
+    บันทึกข้อมูลต้นฉบับลงไฟล์ JSON เป็น fallback
     """
     try:
         # สร้างโฟลเดอร์ output ถ้าไม่มี
@@ -575,7 +691,7 @@ def store_original_to_json(chunks, collection_name):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
-        # บันทึกข้อมูลต้นฉบับ (ไม่มี embeddings และ summary)
+        # บันทึกข้อมูลต้นฉบับ
         original_chunks = []
         for i, chunk in enumerate(chunks):
             print(f"📝 กำลังบันทึกข้อมูลต้นฉบับ chunk {i+1}/{len(chunks)}...")
@@ -584,7 +700,6 @@ def store_original_to_json(chunks, collection_name):
             original_chunk = chunk.copy()
             original_chunk["created_at"] = datetime.now().isoformat()
             
-            # ไม่เพิ่ม embeddings และ summary
             original_chunks.append(original_chunk)
             
             # ตรวจสอบ memory ทุก 5 chunks
@@ -601,80 +716,32 @@ def store_original_to_json(chunks, collection_name):
     except Exception as e:
         print(f"❗ Error saving original data to JSON: {e}")
 
-# ✅ บันทึกข้อมูลที่ประมวลผลแล้วลงไฟล์ JSON (fallback)
-def store_processed_to_json(chunks, collection_name):
-    """
-    บันทึกข้อมูลที่ประมวลผลแล้วลงไฟล์ JSON เป็น fallback (มี embeddings และ summary)
-    """
-    try:
-        # สร้างโฟลเดอร์ output ถ้าไม่มี
-        output_dir = "output"
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        
-        # ประมวลผล chunks
-        processed_chunks = []
-        for i, chunk in enumerate(chunks):
-            print(f"📝 กำลังประมวลผล chunk {i+1}/{len(chunks)}...")
-            
-            # สร้างสำเนาของ chunk และเพิ่มข้อมูลที่ประมวลผลแล้ว
-            processed_chunk = chunk.copy()
-            processed_chunk["created_at"] = datetime.now().isoformat()
-            
-            # สร้าง summary ก่อน
-            summary_text = summarize_with_openai(chunk["text"], chunk["type"])
-            processed_chunk["summary"] = summary_text
-            
-            # สร้าง embeddings จาก summary แทน text ต้นฉบับ
-            processed_chunk["embeddings"] = create_embeddings(summary_text)
-            processed_chunks.append(processed_chunk)
-            
-            # ตรวจสอบ memory ทุก 3 chunks
-            if i % 3 == 0:
-                check_memory()
-        
-        # บันทึกลงไฟล์
-        filename = f"{output_dir}/{collection_name}_processed.json"
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(processed_chunks, f, ensure_ascii=False, indent=2)
-        
-        print(f"✅ บันทึกข้อมูลที่ประมวลผลแล้ว {len(processed_chunks)} chunks ลง {filename}")
-        
-    except Exception as e:
-        print(f"❗ Error saving processed data to JSON: {e}")
-
 # ✅ ฟังก์ชันประมวลผลหน้าเดียว (ตาม flow ที่ออกแบบ - เจออะไรก่อนทำอันนั้น)
-def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_id_counter):
+def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, pdf_path=None):
     """
-    ประมวลผลหน้าเดียว: Extract → Summary → Embedding → Store
+    ประมวลผลหน้าเดียว: Extract → Store
     🆕 แก้ไขให้ทำงานตามลำดับที่เจอในหน้า (เจออะไรก่อนทำอันนั้นก่อน) - เรียงตาม y-coordinate
     
     Args:
         page_num: หมายเลขหน้าที่กำลังประมวลผล (0-based)
         pymupdf_page: หน้า PDF จาก PyMuPDF
-        pdfplumber_pdf: PDF object จาก pdfplumber
-        ocr_reader: OCR reader สำหรับประมวลผลรูปภาพ
+        pdfplumber_pdf: PDF object จาก pdfplumber (fallback)
         doc_id_counter: counter สำหรับสร้าง doc_id
+        pdf_path: path ของไฟล์ PDF (สำหรับใช้กับ camelot)
         
     Returns:
         dict: {
             'has_content': bool,  # มีเนื้อหาหรือไม่ (สำหรับตรวจสอบหน้าเปล่า)
             'text_chunks': list,
             'image_chunks': list,
-            'table_chunks': list,
-            'text_processed_chunks': list,
-            'image_processed_chunks': list,
-            'table_processed_chunks': list
+            'table_chunks': list
         }
     """
     page_results = {
         'has_content': False,
         'text_chunks': [],
         'image_chunks': [],
-        'table_chunks': [],
-        'text_processed_chunks': [],
-        'image_processed_chunks': [],
-        'table_processed_chunks': []
+        'table_chunks': []
     }
     
     try:
@@ -748,8 +815,76 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                     }
                 })
         
-        # 1.3 ดึง Tables พร้อมตำแหน่ง (จาก pdfplumber)
-        if page_num < len(pdfplumber_pdf.pages):
+        # 1.3 ดึง Tables พร้อมตำแหน่ง (ใช้ camelot ถ้ามี, fallback เป็น pdfplumber)
+        tables_found = False
+        
+        # 🆕 ลองใช้ camelot ก่อน (ถ้ามี)
+        if CAMELOT_AVAILABLE and pdf_path:
+            try:
+                # ใช้ camelot extract ตารางจากหน้าเฉพาะ (camelot ใช้ 1-based page numbers)
+                camelot_tables = camelot.read_pdf(pdf_path, pages=str(page_num + 1), flavor='lattice')
+                
+                if len(camelot_tables) > 0:
+                    print(f"   📊 พบ {len(camelot_tables)} ตารางด้วย Camelot")
+                    tables_found = True
+                    
+                    for table_index, table in enumerate(camelot_tables):
+                        try:
+                            # แปลงตารางเป็น list of lists (ไม่ใช้ pandas)
+                            # camelot table.df เป็น DataFrame แต่เราจะแปลงเป็น list โดยใช้ .values.tolist()
+                            try:
+                                # camelot ใช้ pandas DataFrame อยู่แล้ว แต่เราไม่ต้อง import pandas
+                                table_data = table.df.values.tolist()
+                            except:
+                                # Fallback: แปลงเป็น list แบบง่ายๆ
+                                table_data = [[str(cell) for cell in row] for row in table.df.values] if hasattr(table.df, 'values') else []
+                            
+                            # 🆕 ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
+                            table_text = ""
+                            for row in table_data:
+                                if row:
+                                    # ปรับปรุงข้อความในแต่ละเซลล์
+                                    improved_cells = []
+                                    for cell in row:
+                                        cell_str = str(cell).strip() if cell is not None and str(cell).strip() else ""
+                                        if cell_str and PYTHAINLP_AVAILABLE:
+                                            improved_cell = improve_thai_ocr_text(cell_str)
+                                            improved_cells.append(improved_cell)
+                                        else:
+                                            improved_cells.append(cell_str)
+                                    
+                                    row_text = " | ".join(improved_cells)
+                                    if row_text.strip():
+                                        table_text += row_text + "\n"
+                            
+                            if table_text.strip():
+                                # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
+                                improved_table_text = improve_thai_table_text(table_text.strip())
+                                
+                                # ดึง bbox จาก camelot
+                                bbox = table._bbox if hasattr(table, '_bbox') else None
+                                y_pos = bbox[1] if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 2 else 500 + (table_index * 150)
+                                
+                                elements.append({
+                                    'type': 'table',
+                                    'y_pos': y_pos,
+                                    'data': {
+                                        'table_index': table_index,
+                                        'text': improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
+                                        'original_text': table_text.strip(),
+                                        'improved_text': improved_table_text,
+                                        'bbox': bbox
+                                    }
+                                })
+                        except Exception as e:
+                            print(f"   ⚠️ Error processing camelot table {table_index + 1}: {e}")
+                            continue
+            except Exception as e:
+                print(f"   ⚠️ Error using Camelot: {e}, falling back to pdfplumber")
+                tables_found = False
+        
+        # Fallback: ใช้ pdfplumber ถ้า camelot ไม่ได้หรือไม่มี
+        if not tables_found and page_num < len(pdfplumber_pdf.pages):
             pdfplumber_page = pdfplumber_pdf.pages[page_num]
             
             # พยายามหา bbox ของตาราง
@@ -773,12 +908,17 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                                         table_text += row_text + "\n"
                             
                             if table_text.strip():
+                                # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
+                                improved_table_text = improve_thai_table_text(table_text.strip())
+                                
                                 elements.append({
                                     'type': 'table',
                                     'y_pos': y_pos,
                                     'data': {
                                         'table_index': table_index,
-                                        'text': table_text.strip(),
+                                        'text': improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
+                                        'original_text': table_text.strip(),
+                                        'improved_text': improved_table_text,
                                         'bbox': bbox
                                     }
                                 })
@@ -802,6 +942,9 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                                 table_text += row_text + "\n"
                         
                         if table_text.strip():
+                            # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
+                            improved_table_text = improve_thai_table_text(table_text.strip())
+                            
                             # ประมาณตำแหน่งตาราง (ถัดจาก elements อื่นๆ)
                             table_y_pos = base_y_pos + (table_index * 150)
                             elements.append({
@@ -809,7 +952,9 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                                 'y_pos': table_y_pos,
                                 'data': {
                                     'table_index': table_index,
-                                    'text': table_text.strip(),
+                                    'text': improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
+                                    'original_text': table_text.strip(),
+                                    'improved_text': improved_table_text,
                                     'bbox': None
                                 }
                             })
@@ -820,6 +965,164 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
         print(f"📊 พบ {len(elements)} elements: {len([e for e in elements if e['type']=='text'])} text, "
               f"{len([e for e in elements if e['type']=='image'])} images, "
               f"{len([e for e in elements if e['type']=='table'])} tables")
+        
+        # === STEP 2.5: รวม text blocks ที่อยู่ใกล้กัน (ในบรรทัดเดียวกันหรือใกล้กัน) ===
+        # 🆕 เพื่อแก้ปัญหาที่ text blocks ถูกแบ่งเป็น chunks เล็กเกินไป
+        text_elements = [e for e in elements if e['type'] == 'text']
+        if text_elements:
+            # 🆕 กลยุทธ์การรวม: รวม text blocks ที่อยู่ใกล้กันมากขึ้น
+            # ใช้ threshold ที่ใหญ่ขึ้น (50 pixels) และรวม chunks ที่สั้นมาก (< 100 ตัวอักษร) เข้าด้วยกัน
+            merged_text_chunks = []
+            current_chunk_texts = []
+            current_chunk_y_pos = None
+            current_chunk_bbox = None
+            Y_POS_THRESHOLD = 50  # 🆕 เพิ่มจาก 20 เป็น 50 pixels เพื่อรวม chunks ที่อยู่ห่างกันมากขึ้น
+            MAX_CHUNK_LENGTH = 2000  # 🆕 กำหนดขนาดสูงสุดของ chunk (2000 ตัวอักษร) เพื่อป้องกัน chunks ใหญ่เกินไป
+            
+            for text_elem in text_elements:
+                y_pos = text_elem['y_pos']
+                text_content = text_elem['data']['text']
+                bbox = text_elem['data'].get('bbox')
+                text_length = len(text_content) if text_content else 0
+                
+                # 🆕 ถ้า chunk สั้นมาก (< 100 ตัวอักษร) ให้รวมกับ chunk ก่อนหน้าเสมอ (ถ้ามี)
+                # หรือถ้า y_pos ใกล้กับ block ก่อนหน้า ให้รวมกัน
+                should_merge = False
+                if current_chunk_y_pos is None:
+                    should_merge = True  # block แรก
+                elif abs(y_pos - current_chunk_y_pos) <= Y_POS_THRESHOLD:
+                    should_merge = True  # y_pos ใกล้กัน
+                elif text_length < 100:
+                    # 🆕 ถ้า chunk สั้นมาก ให้รวมกับ chunk ก่อนหน้า (แม้ y_pos จะห่างกัน)
+                    # แต่ต้องไม่ห่างเกินไป (ภายใน 100 pixels)
+                    if abs(y_pos - current_chunk_y_pos) <= 100:
+                        should_merge = True
+                
+                if should_merge:
+                    # 🆕 ตรวจสอบว่าถ้ารวม text นี้เข้าไปแล้ว chunk จะใหญ่เกินไปหรือไม่
+                    potential_text = " ".join(current_chunk_texts + [text_content])
+                    if len(potential_text) > MAX_CHUNK_LENGTH:
+                        # ถ้า chunk จะใหญ่เกินไป ให้บันทึก chunk ปัจจุบันก่อน แล้วเริ่ม chunk ใหม่
+                        if current_chunk_texts:
+                            merged_text = " ".join(current_chunk_texts)
+                            merged_text_chunks.append({
+                                'text': merged_text,
+                                'y_pos': current_chunk_y_pos,
+                                'bbox': current_chunk_bbox
+                            })
+                        # เริ่ม chunk ใหม่ด้วย text ปัจจุบัน
+                        current_chunk_texts = [text_content]
+                        current_chunk_y_pos = y_pos
+                        current_chunk_bbox = bbox
+                    else:
+                        # ถ้า chunk ยังไม่ใหญ่เกินไป ให้รวม text นี้เข้าไป
+                        current_chunk_texts.append(text_content)
+                        if current_chunk_bbox is None:
+                            current_chunk_bbox = bbox
+                        current_chunk_y_pos = y_pos  # อัพเดท y_pos เป็นของ block ล่าสุด
+                else:
+                    # ถ้า y_pos ต่างกันมาก แสดงว่าเป็นย่อหน้าใหม่ - สร้าง chunk ใหม่
+                    if current_chunk_texts:
+                        merged_text = " ".join(current_chunk_texts)
+                        merged_text_chunks.append({
+                            'text': merged_text,
+                            'y_pos': current_chunk_y_pos,
+                            'bbox': current_chunk_bbox
+                        })
+                    # เริ่ม chunk ใหม่
+                    current_chunk_texts = [text_content]
+                    current_chunk_y_pos = y_pos
+                    current_chunk_bbox = bbox
+            
+            # เพิ่ม chunk สุดท้าย
+            if current_chunk_texts:
+                merged_text = " ".join(current_chunk_texts)
+                merged_text_chunks.append({
+                    'text': merged_text,
+                    'y_pos': current_chunk_y_pos,
+                    'bbox': current_chunk_bbox
+                })
+            
+            # 🆕 ถ้ายังมี chunks ที่สั้นมาก (< 100 ตัวอักษร) ให้รวมกับ chunks ที่อยู่ใกล้กัน
+            # รอบที่ 2: รวม chunks ที่สั้นมากกับ chunks ที่อยู่ใกล้กัน
+            final_merged_chunks = []
+            for i, chunk in enumerate(merged_text_chunks):
+                chunk_text = chunk['text']
+                chunk_length = len(chunk_text) if chunk_text else 0
+                chunk_y_pos = chunk['y_pos']
+                
+                # ถ้า chunk สั้นมาก (< 100 ตัวอักษร) และมี chunk ถัดไป ให้รวมกัน
+                if chunk_length < 100 and i < len(merged_text_chunks) - 1:
+                    next_chunk = merged_text_chunks[i + 1]
+                    next_y_pos = next_chunk['y_pos']
+                    next_text = next_chunk['text']
+                    next_length = len(next_text) if next_text else 0
+                    # ถ้า y_pos ใกล้กัน (ภายใน 100 pixels) ให้รวมกัน
+                    if abs(next_y_pos - chunk_y_pos) <= 100:
+                        # 🆕 ตรวจสอบว่าถ้ารวมแล้ว chunk จะใหญ่เกินไปหรือไม่
+                        combined_text = chunk_text + " " + next_text
+                        if len(combined_text) <= MAX_CHUNK_LENGTH:
+                            # รวมกับ chunk ถัดไป
+                            final_merged_chunks.append({
+                                'text': combined_text,
+                                'y_pos': chunk_y_pos,
+                                'bbox': chunk.get('bbox')
+                            })
+                            # ข้าม chunk ถัดไป (เพราะรวมแล้ว)
+                            merged_text_chunks[i + 1] = None  # mark as merged
+                        else:
+                            # ถ้า chunk จะใหญ่เกินไป ให้เก็บ chunk ปัจจุบันไว้
+                            final_merged_chunks.append(chunk)
+                    else:
+                        final_merged_chunks.append(chunk)
+                else:
+                    # ถ้า chunk นี้ถูก mark เป็น None (ถูกรวมไปแล้ว) ให้ข้าม
+                    if chunk is not None:
+                        final_merged_chunks.append(chunk)
+            
+            # กรอง None ออก
+            final_merged_chunks = [c for c in final_merged_chunks if c is not None]
+            
+            # แทนที่ text elements เดิมด้วย merged chunks
+            # ลบ text elements เดิมออกจาก elements list
+            elements = [e for e in elements if e['type'] != 'text']
+            # เพิ่ม merged text chunks กลับเข้าไป
+            for merged_chunk in final_merged_chunks:
+                elements.append({
+                    'type': 'text_merged',
+                    'y_pos': merged_chunk['y_pos'],
+                    'data': {
+                        'text': merged_chunk['text'],
+                        'bbox': merged_chunk.get('bbox')
+                    }
+                })
+            
+            # เรียงลำดับใหม่หลังจาก merge
+            elements.sort(key=lambda x: x['y_pos'])
+            print(f"🔄 รวม text blocks เป็น {len(final_merged_chunks)} chunks (จาก {len(text_elements)} blocks เดิม)")
+            
+            # 🆕 ตรวจสอบและแสดงสถิติของ chunks
+            chunk_lengths = [len(chunk['text']) for chunk in final_merged_chunks if chunk.get('text')]
+            if chunk_lengths:
+                avg_length = sum(chunk_lengths) / len(chunk_lengths)
+                max_length = max(chunk_lengths)
+                min_length = min(chunk_lengths)
+                chunks_over_limit = sum(1 for length in chunk_lengths if length > MAX_CHUNK_LENGTH)
+                
+                print(f"   📊 สถิติ chunks:")
+                print(f"      - จำนวน chunks: {len(final_merged_chunks)}")
+                print(f"      - ขนาดเฉลี่ย: {avg_length:.0f} ตัวอักษร")
+                print(f"      - ขนาดสูงสุด: {max_length} ตัวอักษร")
+                print(f"      - ขนาดต่ำสุด: {min_length} ตัวอักษร")
+                if chunks_over_limit > 0:
+                    print(f"      ⚠️ พบ {chunks_over_limit} chunks ที่ใหญ่เกิน {MAX_CHUNK_LENGTH} ตัวอักษร")
+                else:
+                    print(f"      ✅ ทุก chunks มีขนาดไม่เกิน {MAX_CHUNK_LENGTH} ตัวอักษร")
+            
+            for i, chunk in enumerate(final_merged_chunks[:5], 1):  # แสดง 5 อันดับแรก
+                chunk_length = len(chunk.get('text', ''))
+                size_indicator = " ⚠️ ใหญ่เกินไป" if chunk_length > MAX_CHUNK_LENGTH else ""
+                print(f"   📝 Merged chunk {i}: {chunk_length} ตัวอักษร{size_indicator}")
         
         # === STEP 3: ประมวลผลตามลำดับที่เรียงแล้ว (เจออะไรก่อนทำอันนั้นก่อน) ===
         text_chunk_counter = 0
@@ -833,8 +1136,8 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
             print(f"\n📌 Element {element_index + 1}/{len(elements)}: {element_type.upper()} "
                   f"(y={element['y_pos']:.1f})")
             
-            if element_type == 'text':
-                # ประมวลผล Text Block
+            if element_type == 'text' or element_type == 'text_merged':
+                # ประมวลผล Text Block (ทั้งแบบเดิมและแบบ merged)
                 page_results['has_content'] = True
                 text_content = data['text']
                 print(f"   📝 Text: {len(text_content)} ตัวอักษร")
@@ -847,20 +1150,8 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                     "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_text_{text_chunk_counter}",
                     "bbox": convert_bbox_to_mongodb_format(data['bbox'])
                 }
-                # ✅ Original chunk: ไม่มี embeddings (เก็บต้นฉบับเท่านั้น)
                 page_results['text_chunks'].append(text_chunk)
                 text_chunk_counter += 1
-                
-                # สร้าง summary และ embeddings สำหรับ processed chunk
-                print(f"   🔄 กำลังสร้าง summary...")
-                summary_text = summarize_with_openai(text_chunk["text"], "text")
-                print(f"   🔄 กำลังสร้าง embeddings...")
-                text_processed_chunk = text_chunk.copy()
-                text_processed_chunk["summary"] = summary_text
-                text_processed_chunk["embeddings"] = create_embeddings(summary_text)  # embeddings จาก summary
-                text_processed_chunk["created_at"] = datetime.now()
-                page_results['text_processed_chunks'].append(text_processed_chunk)
-                print(f"   ✅ สร้าง summary และ embeddings แล้ว")
             
             elif element_type == 'image':
                 # ประมวลผล Image
@@ -889,10 +1180,9 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                         del image, image_bytes
                         continue
                     
-                    # OCR
+                    # OCR (ใช้ Typhoon OCR)
                     print(f"   🔍 กำลังทำ OCR...")
-                    ocr_results = ocr_reader.readtext(image_bytes)
-                    ocr_text = " ".join([result[1] for result in ocr_results if result[2] > 0.3])
+                    ocr_text = perform_ocr_on_image_bytes(image_bytes)
                     
                     if ocr_text.strip():
                         page_results['has_content'] = True
@@ -900,10 +1190,6 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                         improved_text = improve_thai_ocr_text(ocr_text)
                         
                         print(f"   🖼️ Image {img_index + 1}: {len(improved_text)} ตัวอักษร (OCR: {len(ocr_text)} ตัวอักษร)")
-                        
-                        # 🆕 สร้าง image embedding จากข้อความ OCR (ใช้โมเดลเดียวกับ text)
-                        print(f"   🔄 กำลังสร้าง image embedding...")
-                        image_embedding = create_image_embeddings(improved_text)
                         
                         # Create image chunk
                         image_chunk = {
@@ -918,36 +1204,13 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
                             "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_img_{img_index + 1}",
                             "bbox": convert_bbox_to_mongodb_format(data['bbox'])
                         }
-                        # ✅ Original chunk: ไม่มี embeddings (เก็บต้นฉบับเท่านั้น)
                         page_results['image_chunks'].append(image_chunk)
                         image_chunk_counter += 1
-                        
-                        # สร้าง summary และ embeddings สำหรับ processed chunk
-                        print(f"   🔄 กำลังสร้าง summary...")
-                        summary_text = summarize_with_openai(image_chunk["text"], "image")
-                        print(f"   🔄 กำลังสร้าง embeddings...")
-                        text_embedding = create_embeddings(summary_text)
-                        
-                        # สร้าง image embedding สำหรับ processed chunk
-                        if image_embedding is not None:
-                            print(f"   ✅ สร้าง image embedding สำเร็จ ({len(image_embedding)} dimensions)")
-                        
-                        image_processed_chunk = image_chunk.copy()
-                        image_processed_chunk["summary"] = summary_text
-                        image_processed_chunk["embeddings"] = text_embedding  # text embedding จาก summary
-                        image_processed_chunk["created_at"] = datetime.now()
-                        
-                        # เพิ่ม image embedding ใน processed chunk ด้วย
-                        if image_embedding is not None:
-                            image_processed_chunk["image_embeddings"] = image_embedding
-                        
-                        page_results['image_processed_chunks'].append(image_processed_chunk)
-                        print(f"   ✅ สร้าง summary, text embeddings และ image embeddings แล้ว")
                     else:
                         print(f"   ⚠️ ไม่พบข้อความในรูปภาพ {img_index + 1} (OCR ไม่เจอข้อความ) - ข้าม")
                     
                     # ล้าง memory
-                    del image, image_bytes, ocr_results
+                    del image, image_bytes
                     
                 except Exception as e:
                     print(f"   ❗ Error processing image {img_index + 1}: {e}")
@@ -957,37 +1220,35 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
             
             elif element_type == 'table':
                 # ประมวลผล Table
-                table_text = data['text']
+                # 🆕 ใช้ improved_text ถ้ามี (จาก camelot) ไม่งั้นใช้ text และปรับปรุง
+                table_text = data.get('original_text') or data.get('text', '')
+                improved_table_text = data.get('improved_text') or data.get('text', '')
                 table_index = data['table_index']
                 
-                if table_text.strip():
+                # ถ้ายังไม่ได้ปรับปรุง ให้ปรับปรุงตอนนี้
+                if not data.get('improved_text'):
+                    improved_table_text = improve_thai_table_text(table_text)
+                
+                if improved_table_text.strip():
                     page_results['has_content'] = True
-                    print(f"   📊 Table {table_index + 1}: {len(table_text)} ตัวอักษร")
+                    
+                    print(f"   📊 Table {table_index + 1}: {len(improved_table_text)} ตัวอักษร" + 
+                          (f" (ปรับปรุงแล้ว: {len(table_text)} → {len(improved_table_text)})" if table_text else ""))
                     
                     # Create table chunk
                     table_chunk = {
-                        "text": table_text,
+                        "text": improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
                         "type": "table",
                         "chunk_id": table_chunk_counter,
                         "page": page_num + 1,
                         "table_index": table_index + 1,
+                        "original_text": table_text if table_text else improved_table_text,  # เก็บข้อความเดิมไว้ด้วย
+                        "improved_text": improved_table_text,  # เก็บข้อความที่ปรับปรุงแล้ว
                         "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_table_{table_index + 1}",
-                        "bbox": convert_bbox_to_mongodb_format(data['bbox'])
+                        "bbox": convert_bbox_to_mongodb_format(data.get('bbox'))
                     }
-                    # ✅ Original chunk: ไม่มี embeddings (เก็บต้นฉบับเท่านั้น)
                     page_results['table_chunks'].append(table_chunk)
                     table_chunk_counter += 1
-                    
-                    # สร้าง summary และ embeddings สำหรับ processed chunk
-                    print(f"   🔄 กำลังสร้าง summary...")
-                    summary_text = summarize_with_openai(table_chunk["text"], "table")
-                    print(f"   🔄 กำลังสร้าง embeddings...")
-                    table_processed_chunk = table_chunk.copy()
-                    table_processed_chunk["summary"] = summary_text
-                    table_processed_chunk["embeddings"] = create_embeddings(summary_text)  # embeddings จาก summary
-                    table_processed_chunk["created_at"] = datetime.now()
-                    page_results['table_processed_chunks'].append(table_processed_chunk)
-                    print(f"   ✅ สร้าง summary และ embeddings แล้ว")
         
         # สรุปผลการประมวลผลหน้า
         if not page_results['has_content']:
@@ -1013,6 +1274,7 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_
 def store_page_results_to_mongodb(page_results, client, is_first_page=False):
     """
     บันทึกผลลัพธ์จากหนึ่งหน้าลง MongoDB ทันที
+    🆕 เพิ่มการสร้าง embeddings ก่อนบันทึก
     
     Args:
         page_results: ผลลัพธ์จาก process_single_page()
@@ -1020,17 +1282,12 @@ def store_page_results_to_mongodb(page_results, client, is_first_page=False):
         is_first_page: เป็นหน้าแรกหรือไม่ (ถ้าใช่จะลบข้อมูลเก่าก่อน)
     """
     try:
-        # เตรียม databases และ collections
+        # เตรียม database และ collections
         db_original = client[ORIGINAL_DB_NAME]
-        db_summary = client[SUMMARY_DB_NAME]
         
         orig_text_col = db_original[ORIGINAL_TEXT_COLLECTION]
         orig_image_col = db_original[ORIGINAL_IMAGE_COLLECTION]
         orig_table_col = db_original[ORIGINAL_TABLE_COLLECTION]
-        
-        proc_text_col = db_summary[PROCESSED_TEXT_COLLECTION]
-        proc_image_col = db_summary[PROCESSED_IMAGE_COLLECTION]
-        proc_table_col = db_summary[PROCESSED_TABLE_COLLECTION]
         
         # ลบข้อมูลเก่าครั้งเดียวตอนหน้าแรก
         if is_first_page:
@@ -1038,54 +1295,58 @@ def store_page_results_to_mongodb(page_results, client, is_first_page=False):
             orig_text_col.delete_many({})
             orig_image_col.delete_many({})
             orig_table_col.delete_many({})
-            proc_text_col.delete_many({})
-            proc_image_col.delete_many({})
-            proc_table_col.delete_many({})
             print("✅ ลบข้อมูลเก่าเสร็จสิ้น")
         
-        # เพิ่ม created_at ให้ทุก chunk
+        # เพิ่ม created_at และ embeddings ให้ทุก chunk
         now = datetime.now()
         
-        # บันทึก Original Data
+        # บันทึก Original Data - Text Chunks
         if page_results['text_chunks']:
+            print(f"   🔄 กำลังสร้าง embeddings สำหรับ {len(page_results['text_chunks'])} text chunks...")
             for chunk in page_results['text_chunks']:
                 chunk['created_at'] = now
+                # 🆕 สร้าง embedding จาก text
+                text_content = chunk.get('text', '')
+                if text_content:
+                    embedding = create_text_embedding(text_content)
+                    if embedding:
+                        chunk['embeddings'] = embedding
+                    else:
+                        print(f"   ⚠️ ไม่สามารถสร้าง embedding สำหรับ text chunk {chunk.get('chunk_id', 'unknown')} ได้")
             orig_text_col.insert_many(page_results['text_chunks'])
-            print(f"   ✅ บันทึก {len(page_results['text_chunks'])} text chunks (original)")
+            print(f"   ✅ บันทึก {len(page_results['text_chunks'])} text chunks (พร้อม embeddings)")
         
+        # บันทึก Original Data - Image Chunks
         if page_results['image_chunks']:
+            print(f"   🔄 กำลังสร้าง embeddings สำหรับ {len(page_results['image_chunks'])} image chunks...")
             for chunk in page_results['image_chunks']:
                 chunk['created_at'] = now
+                # 🆕 สร้าง embedding จาก text (ข้อความที่ได้จาก OCR)
+                text_content = chunk.get('text', '')
+                if text_content:
+                    embedding = create_text_embedding(text_content)
+                    if embedding:
+                        chunk['embeddings'] = embedding
+                    else:
+                        print(f"   ⚠️ ไม่สามารถสร้าง embedding สำหรับ image chunk {chunk.get('chunk_id', 'unknown')} ได้")
             orig_image_col.insert_many(page_results['image_chunks'])
-            print(f"   ✅ บันทึก {len(page_results['image_chunks'])} image chunks (original)")
+            print(f"   ✅ บันทึก {len(page_results['image_chunks'])} image chunks (พร้อม embeddings)")
         
+        # บันทึก Original Data - Table Chunks
         if page_results['table_chunks']:
+            print(f"   🔄 กำลังสร้าง embeddings สำหรับ {len(page_results['table_chunks'])} table chunks...")
             for chunk in page_results['table_chunks']:
                 chunk['created_at'] = now
+                # 🆕 สร้าง embedding จาก text
+                text_content = chunk.get('text', '')
+                if text_content:
+                    embedding = create_text_embedding(text_content)
+                    if embedding:
+                        chunk['embeddings'] = embedding
+                    else:
+                        print(f"   ⚠️ ไม่สามารถสร้าง embedding สำหรับ table chunk {chunk.get('chunk_id', 'unknown')} ได้")
             orig_table_col.insert_many(page_results['table_chunks'])
-            print(f"   ✅ บันทึก {len(page_results['table_chunks'])} table chunks (original)")
-        
-        # บันทึก Processed Data (มี summary และ embeddings แล้ว)
-        if page_results['text_processed_chunks']:
-            for chunk in page_results['text_processed_chunks']:
-                if 'created_at' not in chunk:
-                    chunk['created_at'] = now
-            proc_text_col.insert_many(page_results['text_processed_chunks'])
-            print(f"   ✅ บันทึก {len(page_results['text_processed_chunks'])} text chunks (processed)")
-        
-        if page_results['image_processed_chunks']:
-            for chunk in page_results['image_processed_chunks']:
-                if 'created_at' not in chunk:
-                    chunk['created_at'] = now
-            proc_image_col.insert_many(page_results['image_processed_chunks'])
-            print(f"   ✅ บันทึก {len(page_results['image_processed_chunks'])} image chunks (processed)")
-        
-        if page_results['table_processed_chunks']:
-            for chunk in page_results['table_processed_chunks']:
-                if 'created_at' not in chunk:
-                    chunk['created_at'] = now
-            proc_table_col.insert_many(page_results['table_processed_chunks'])
-            print(f"   ✅ บันทึก {len(page_results['table_processed_chunks'])} table chunks (processed)")
+            print(f"   ✅ บันทึก {len(page_results['table_chunks'])} table chunks (พร้อม embeddings)")
         
         return True
         
@@ -1097,7 +1358,7 @@ def store_page_results_to_mongodb(page_results, client, is_first_page=False):
 
 # ✅ ฟังก์ชันหลัก (ประมวลผลหนึ่งหน้า → บันทึก → loop ต่อ)
 def main():
-    print("🚀 เริ่ม Pipeline: Extract → OCR + PyThaiNLP → Summary → Embedding → Store")
+    print("🚀 เริ่ม Pipeline: Extract → OCR + PyThaiNLP → Store")
     print("📄 ประมวลผลหนึ่งหน้า → บันทึก MongoDB → loop ต่อ")
     print()
     
@@ -1113,7 +1374,6 @@ def main():
         # เปิดไฟล์ PDF ทั้ง PyMuPDF และ pdfplumber
         pymupdf_doc = fitz.open(PDF_PATH)
         pdfplumber_pdf = pdfplumber.open(PDF_PATH)
-        ocr_reader = get_ocr_reader()
         
         total_pages = len(pymupdf_doc)
         print(f"📚 จำนวนหน้าทั้งหมด: {total_pages} หน้า")
@@ -1128,9 +1388,6 @@ def main():
         total_text_chunks = 0
         total_image_chunks = 0
         total_table_chunks = 0
-        total_text_processed = 0
-        total_image_processed = 0
-        total_table_processed = 0
         
         doc_id_counter = 1  # สำหรับสร้าง doc_id
         
@@ -1141,13 +1398,13 @@ def main():
             print(f"📄 กำลังประมวลผลหน้า {page_num + 1}/{total_pages}")
             print(f"{'='*60}")
             
-            # ประมวลผลหน้าเดียว (Extract → Summary → Embedding)
+            # ประมวลผลหน้าเดียว (Extract)
             page_results = process_single_page(
                 page_num=page_num,
                 pymupdf_page=pymupdf_doc[page_num],
                 pdfplumber_pdf=pdfplumber_pdf,
-                ocr_reader=ocr_reader,
-                doc_id_counter=doc_id_counter
+                doc_id_counter=doc_id_counter,
+                pdf_path=PDF_PATH  # 🆕 ส่ง pdf_path สำหรับใช้กับ camelot
             )
             
             # บันทึกลง MongoDB ทันที (หน้าแรกจะลบข้อมูลเก่าก่อน)
@@ -1161,9 +1418,6 @@ def main():
                 total_text_chunks += len(page_results['text_chunks'])
                 total_image_chunks += len(page_results['image_chunks'])
                 total_table_chunks += len(page_results['table_chunks'])
-                total_text_processed += len(page_results['text_processed_chunks'])
-                total_image_processed += len(page_results['image_processed_chunks'])
-                total_table_processed += len(page_results['table_processed_chunks'])
                 
                 print(f"✅ บันทึกหน้า {page_num + 1} เสร็จสิ้น")
             else:
@@ -1189,18 +1443,14 @@ def main():
         print("\n" + "="*60)
         print("📊 สรุปผลการประมวลผลทั้งหมด")
         print("="*60)
-        print(f"   📝 Text chunks (original): {total_text_chunks}")
-        print(f"   🖼️ Image chunks (original): {total_image_chunks}")
-        print(f"   📊 Table chunks (original): {total_table_chunks}")
-        print(f"   📝 Text chunks (processed): {total_text_processed}")
-        print(f"   🖼️ Image chunks (processed): {total_image_processed}")
-        print(f"   📊 Table chunks (processed): {total_table_processed}")
-        print(f"   📊 Total processed chunks: {total_text_processed + total_image_processed + total_table_processed}")
+        print(f"   📝 Text chunks: {total_text_chunks}")
+        print(f"   🖼️ Image chunks: {total_image_chunks}")
+        print(f"   📊 Table chunks: {total_table_chunks}")
+        print(f"   📊 Total chunks: {total_text_chunks + total_image_chunks + total_table_chunks}")
         
         print("\n✅ Pipeline เสร็จสิ้น!")
         print(f"✅ ข้อมูลทั้งหมดถูกบันทึกใน MongoDB:")
-        print(f"   - Original: {ORIGINAL_DB_NAME}")
-        print(f"   - Summary: {SUMMARY_DB_NAME}")
+        print(f"   - Database: {ORIGINAL_DB_NAME}")
         
     except Exception as e:
         print(f"❗ Error in main pipeline: {e}")
@@ -1214,14 +1464,15 @@ def main():
         if client:
             try:
                 db_original = client[ORIGINAL_DB_NAME]
-                db_summary = client[SUMMARY_DB_NAME]
                 
                 orig_text_count = db_original[ORIGINAL_TEXT_COLLECTION].count_documents({})
-                proc_text_count = db_summary[PROCESSED_TEXT_COLLECTION].count_documents({})
+                orig_image_count = db_original[ORIGINAL_IMAGE_COLLECTION].count_documents({})
+                orig_table_count = db_original[ORIGINAL_TABLE_COLLECTION].count_documents({})
                 
                 print(f"\n⚠️ ข้อมูลที่บันทึกไปแล้ว:")
                 print(f"   - Original text chunks: {orig_text_count}")
-                print(f"   - Processed text chunks: {proc_text_count}")
+                print(f"   - Original image chunks: {orig_image_count}")
+                print(f"   - Original table chunks: {orig_table_count}")
             except:
                 pass
         
