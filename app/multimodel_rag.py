@@ -18,10 +18,10 @@ from sentence_transformers import SentenceTransformer
 try:
     import camelot
     CAMELOT_AVAILABLE = True
-    print("✅ Camelot loaded successfully")
+    print("✅ โหลด Camelot สำเร็จ")
 except ImportError:
     CAMELOT_AVAILABLE = False
-    print("⚠️ Camelot not available, using pdfplumber for table extraction")
+    print("⚠️ Camelot ไม่พร้อมใช้งาน ใช้ pdfplumber สำหรับการดึงตารางแทน")
 
 # 🆕 เพิ่ม PyThaiNLP สำหรับปรับปรุง OCR
 try:
@@ -29,10 +29,10 @@ try:
     from pythainlp.spell import correct
     from pythainlp.util import normalize
     PYTHAINLP_AVAILABLE = True
-    print("✅ PyThaiNLP loaded successfully")
+    print("✅ โหลด PyThaiNLP สำเร็จ")
 except ImportError:
     PYTHAINLP_AVAILABLE = False
-    print("⚠️ PyThaiNLP not available, using basic text processing")
+    print("⚠️ PyThaiNLP ไม่พร้อมใช้งาน ใช้การประมวลผลข้อความพื้นฐานแทน")
 
 # ✅ แก้ไขปัญหา MPS device, PIL.ANTIALIAS และ tokenizers parallelism
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -79,7 +79,7 @@ def convert_bbox_to_mongodb_format(bbox):
         else:
             return None
     except Exception as e:
-        print(f"   ⚠️ Error converting bbox: {e}")
+        print(f"   ⚠️ เกิดข้อผิดพลาดในการแปลง bbox: {e}")
         return None
 
 # ✅ ฟังก์ชันตรวจสอบ memory
@@ -112,15 +112,17 @@ COMMON_OCR_CORRECTIONS = {
     'เมษ': 'เมษ',
 }
 
-# 🆕 ฟังก์ชันปรับปรุงข้อความไทยจาก OCR ด้วย PyThaiNLP
+# 🆕 ฟังก์ชันปรับปรุงข้อความไทยจาก OCR ด้วย PyThaiNLP (ปรับปรุงให้ดีขึ้น)
 def improve_thai_ocr_text(ocr_text):
     """
-    ปรับปรุงข้อความไทยจาก OCR ด้วย PyThaiNLP
-    - Normalize ข้อความ
-    - แก้ไขคำที่ถูกแยกผิดด้วย dictionary
-    - แก้ไขการเว้นวรรค
-    - แก้ไขคำผิดด้วย spell checker
-    - แบ่งคำด้วย word tokenizer
+    ปรับปรุงข้อความไทยจาก OCR ด้วย PyThaiNLP (เวอร์ชันปรับปรุง)
+    - Normalize ข้อความ (แก้ไขตัวอักษรพิเศษ, วรรณยุกต์)
+    - แก้ไขคำที่ถูกแยกผิดด้วย dictionary (COMMON_OCR_CORRECTIONS)
+    - รวมคำที่ถูกแยกด้วยช่องว่าง (pattern matching)
+    - แก้ไขการเว้นวรรคระหว่างภาษาและตัวเลข
+    - แบ่งคำด้วย word tokenizer (newmm engine)
+    - แก้ไขคำผิดด้วย spell checker (เฉพาะคำไทย)
+    - ทำความสะอาดข้อความขั้นสุดท้าย
     """
     if not PYTHAINLP_AVAILABLE or not ocr_text.strip():
         return ocr_text
@@ -194,58 +196,77 @@ def improve_thai_ocr_text(ocr_text):
         # แก้ไขการเว้นวรรคที่ซ้ำ
         text = re.sub(r'\s+', ' ', text)
         
-        # แบ่งคำด้วย PyThaiNLP (ใช้ newmm engine สำหรับความแม่นยำ)
+        # 🆕 แบ่งคำด้วย PyThaiNLP (ใช้ newmm engine สำหรับความแม่นยำ)
         try:
             words = word_tokenize(text, engine='newmm')
-        except:
+        except Exception as e:
             # Fallback: แบ่งคำแบบง่ายๆ ถ้า word_tokenize ไม่ได้
+            print(f"   ⚠️ word_tokenize ล้มเหลว: {e}, ใช้ simple split แทน")
             words = text.split()
         
-        # แก้ไขคำผิดด้วย PyThaiNLP spell checker
+        # 🆕 แก้ไขคำผิดด้วย PyThaiNLP spell checker (ปรับปรุงให้ดีขึ้น)
         corrected_words = []
         for word in words:
             # ตรวจสอบว่าเป็นคำไทยหรือไม่ (มีตัวอักษรไทย)
             has_thai = bool(re.search(r'[ก-๙]', word))
             
-            if has_thai and len(word) > 2 and word.isalpha():
+            if has_thai and len(word) > 2:
                 # แก้ไขเฉพาะคำไทยที่มีความยาวมากกว่า 2 ตัวอักษร
-                try:
-                    corrected = correct(word)
-                    # ใช้คำที่แก้ไขแล้วถ้าไม่ใช่ None และไม่เหมือนเดิมมากเกินไป
-                    if corrected and corrected != word:
-                        # ตรวจสอบว่าคำที่แก้ไขแล้วมีความยาวใกล้เคียงกับคำเดิม
-                        if abs(len(corrected) - len(word)) <= 2:
-                            corrected_words.append(corrected)
+                # ตรวจสอบว่าเป็นคำที่ประกอบด้วยตัวอักษรเท่านั้น (ไม่รวมตัวเลข/สัญลักษณ์)
+                is_alpha_only = bool(re.match(r'^[ก-๙a-zA-Z]+$', word))
+                
+                if is_alpha_only:
+                    try:
+                        corrected = correct(word)
+                        # ใช้คำที่แก้ไขแล้วถ้าไม่ใช่ None และไม่เหมือนเดิม
+                        if corrected and corrected != word:
+                            # ตรวจสอบว่าคำที่แก้ไขแล้วมีความยาวใกล้เคียงกับคำเดิม (อนุญาตให้ต่างได้ 2 ตัวอักษร)
+                            length_diff = abs(len(corrected) - len(word))
+                            # ตรวจสอบว่าคำที่แก้ไขแล้วมีตัวอักษรไทย (ไม่ใช่คำแปลกๆ)
+                            has_thai_corrected = bool(re.search(r'[ก-๙]', corrected))
+                            
+                            if length_diff <= 2 and has_thai_corrected:
+                                corrected_words.append(corrected)
+                            else:
+                                corrected_words.append(word)
                         else:
                             corrected_words.append(word)
-                    else:
+                    except Exception as e:
+                        # ถ้าแก้ไขไม่ได้ ให้ใช้คำเดิม
                         corrected_words.append(word)
-                except Exception as e:
-                    # ถ้าแก้ไขไม่ได้ ให้ใช้คำเดิม
+                else:
+                    # มีตัวเลขหรือสัญลักษณ์ ให้เก็บไว้ตามเดิม
                     corrected_words.append(word)
             else:
-                # ไม่ใช่คำไทย หรือเป็นตัวเลข/สัญลักษณ์ ให้เก็บไว้ตามเดิม
+                # ไม่ใช่คำไทย หรือสั้นเกินไป หรือเป็นตัวเลข/สัญลักษณ์ ให้เก็บไว้ตามเดิม
                 corrected_words.append(word)
         
         # รวมคำกลับเป็นประโยค
         improved_text = ' '.join(corrected_words)
         
-        # ทำความสะอาดอีกครั้ง
-        improved_text = re.sub(r'\s+', ' ', improved_text).strip()
+        # 🆕 ทำความสะอาดขั้นสุดท้าย (ปรับปรุงให้ดีขึ้น)
+        # ลบช่องว่างซ้ำ
+        improved_text = re.sub(r'\s+', ' ', improved_text)
+        # ลบช่องว่างหน้าและหลังเครื่องหมายวรรคตอน
+        improved_text = re.sub(r'\s+([,\.;:!?])', r'\1', improved_text)
+        improved_text = re.sub(r'([,\.;:!?])\s+', r'\1 ', improved_text)
+        # ลบช่องว่างที่ต้นและท้าย
+        improved_text = improved_text.strip()
         
         return improved_text
         
     except Exception as e:
-        print(f"⚠️ Error in Thai text improvement: {e}")
+        print(f"⚠️ เกิดข้อผิดพลาดในการปรับปรุงข้อความไทย: {e}")
         return ocr_text
 
-# 🆕 ฟังก์ชันปรับปรุงข้อความในตารางด้วย PyThaiNLP
+# 🆕 ฟังก์ชันปรับปรุงข้อความในตารางด้วย PyThaiNLP (ปรับปรุงให้ดีขึ้น)
 def improve_thai_table_text(table_text):
     """
-    ปรับปรุงข้อความในตารางด้วย PyThaiNLP
+    ปรับปรุงข้อความในตารางด้วย PyThaiNLP (เวอร์ชันปรับปรุง)
     - แยกแต่ละเซลล์ในตาราง (แยกด้วย " | ")
-    - ปรับปรุงข้อความในแต่ละเซลล์
+    - ปรับปรุงข้อความในแต่ละเซลล์ด้วย improve_thai_ocr_text() (normalize, spell check, word tokenize)
     - รักษาโครงสร้างตาราง (แถวและคอลัมน์)
+    - ทำความสะอาดข้อความขั้นสุดท้าย
     """
     if not PYTHAINLP_AVAILABLE or not table_text.strip():
         return table_text
@@ -260,118 +281,134 @@ def improve_thai_table_text(table_text):
                 improved_rows.append(row)
                 continue
             
-            # แยกเซลล์ด้วย " | "
-            cells = row.split(' | ')
+            # แยกเซลล์ด้วย " | " (รองรับทั้ง " | " และ "|")
+            # ใช้ regex เพื่อแยกเซลล์ที่ถูกต้อง (ไม่แยกในกรณีที่มี " | " ในข้อความ)
+            cells = [cell.strip() for cell in row.split(' | ')]
             improved_cells = []
             
             for cell in cells:
                 if cell.strip():
-                    # ปรับปรุงข้อความในแต่ละเซลล์
+                    # ✅ ปรับปรุงข้อความในแต่ละเซลล์ด้วย improve_thai_ocr_text()
+                    # ซึ่งจะทำ normalize, spell check, word tokenize, และทำความสะอาด
                     improved_cell = improve_thai_ocr_text(cell.strip())
                     improved_cells.append(improved_cell)
                 else:
                     improved_cells.append(cell)
             
-            # รวมเซลล์กลับเป็นแถว
+            # รวมเซลล์กลับเป็นแถว (ใช้ " | " เป็นตัวคั่น)
             improved_row = ' | '.join(improved_cells)
             improved_rows.append(improved_row)
         
         # รวมแถวกลับเป็นตาราง
         improved_table = '\n'.join(improved_rows)
         
+        # 🆕 ทำความสะอาดข้อความขั้นสุดท้าย
+        # ลบช่องว่างซ้ำในแต่ละแถว
+        improved_table = re.sub(r' +', ' ', improved_table)
+        # ลบช่องว่างที่ต้นและท้ายแต่ละแถว
+        improved_table = '\n'.join([row.strip() for row in improved_table.split('\n')])
+        
         return improved_table
         
     except Exception as e:
-        print(f"⚠️ Error in Thai table text improvement: {e}")
+        print(f"⚠️ เกิดข้อผิดพลาดในการปรับปรุงข้อความตารางไทย: {e}")
         return table_text
 
 def get_ocr_reader():
-    """โหลด OCR reader แบบ lazy loading (ใช้ Typhoon OCR)"""
+    """โหลด OCR reader แบบ lazy loading (ใช้เฉพาะ Typhoon OCR)"""
     if not hasattr(get_ocr_reader, 'reader'):
-        print("🔄 Loading Typhoon OCR...")
+        print("🔄 กำลังโหลด Typhoon OCR...")
         try:
             from typhoon_ocr import ocr_document
             # ตรวจสอบ API key
             api_key = os.getenv("TYPHOON_OCR_API_KEY")
             if not api_key:
-                print("⚠️ TYPHOON_OCR_API_KEY not found in environment variables")
-                print("   Falling back to EasyOCR. Set TYPHOON_OCR_API_KEY to use Typhoon OCR")
-                raise ValueError("API key not found")
+                error_msg = "ไม่พบ TYPHOON_OCR_API_KEY ในตัวแปรสภาพแวดล้อม กรุณาตั้งค่า TYPHOON_OCR_API_KEY เพื่อใช้ Typhoon OCR"
+                print(f"❌ {error_msg}")
+                raise ValueError(error_msg)
             
             # ยืนยันว่า API key ถูกโหลดแล้ว (ไม่แสดงค่าเพื่อความปลอดภัย)
-            print(f"✅ TYPHOON_OCR_API_KEY loaded (length: {len(api_key)} characters)")
+            print(f"✅ โหลด TYPHOON_OCR_API_KEY สำเร็จ (ความยาว: {len(api_key)} ตัวอักษร)")
             
             get_ocr_reader.ocr_document = ocr_document
             get_ocr_reader.reader = "typhoon_ocr"  # ใช้เป็น flag
-            print("✅ Typhoon OCR loaded successfully")
-        except (ImportError, ValueError) as e:
-            print(f"⚠️ Typhoon OCR not available ({e}), falling back to EasyOCR")
-            import easyocr
-            get_ocr_reader.reader = easyocr.Reader(['en', 'th'], gpu=False, verbose=False)
-            get_ocr_reader.ocr_document = None
+            print("✅ โหลด Typhoon OCR สำเร็จ")
+        except ImportError as e:
+            error_msg = f"ไลบรารี Typhoon OCR ไม่พร้อมใช้งาน กรุณาติดตั้งแพ็กเกจ typhoon-ocr ข้อผิดพลาด: {e}"
+            print(f"❌ {error_msg}")
+            raise ImportError(error_msg)
+        except ValueError as e:
+            raise  # Re-raise ValueError from API key check
+        except Exception as e:
+            error_msg = f"ไม่สามารถโหลด Typhoon OCR ได้: {e}"
+            print(f"❌ {error_msg}")
+            raise RuntimeError(error_msg)
     return get_ocr_reader.reader
 
 def perform_ocr_on_image_bytes(image_bytes):
     """
-    ทำ OCR บน image bytes โดยใช้ Typhoon OCR หรือ EasyOCR (fallback)
+    ทำ OCR บน image bytes โดยใช้เฉพาะ Typhoon OCR
     
     Args:
         image_bytes: bytes ของรูปภาพ
         
     Returns:
-        str: ข้อความที่ได้จาก OCR
+        str: ข้อความที่ได้จาก OCR (ผ่านการปรับปรุงด้วย PyThaiNLP แล้ว)
+        
+    Raises:
+        RuntimeError: ถ้าไม่สามารถใช้ Typhoon OCR ได้
     """
+    # ตรวจสอบว่าใช้ Typhoon OCR
     reader = get_ocr_reader()
+    if reader != "typhoon_ocr" or not hasattr(get_ocr_reader, 'ocr_document'):
+        raise RuntimeError("Typhoon OCR ไม่พร้อมใช้งาน กรุณาตรวจสอบ TYPHOON_OCR_API_KEY และการติดตั้ง typhoon-ocr")
     
-    # ตรวจสอบว่าใช้ Typhoon OCR หรือ EasyOCR
-    if reader == "typhoon_ocr" and hasattr(get_ocr_reader, 'ocr_document'):
-        try:
-            # สร้างไฟล์ชั่วคราว
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
-                tmp_file.write(image_bytes)
-                tmp_path = tmp_file.name
-            
+    # สร้างไฟล์ชั่วคราว
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+            tmp_file.write(image_bytes)
+            tmp_path = tmp_file.name
+        
+        # เรียกใช้ Typhoon OCR
+        ocr_document = get_ocr_reader.ocr_document
+        markdown_text = ocr_document(pdf_or_image_path=tmp_path)
+        
+        # แปลง markdown เป็น plain text (ลบ markdown syntax)
+        # ลบ markdown headers, bold, italic, etc.
+        text = re.sub(r'#+\s*', '', markdown_text)  # ลบ headers
+        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # ลบ bold
+        text = re.sub(r'\*([^*]+)\*', r'\1', text)  # ลบ italic
+        text = re.sub(r'`([^`]+)`', r'\1', text)  # ลบ code
+        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # ลบ links
+        text = re.sub(r'\n+', ' ', text)  # แทนที่ newlines ด้วย space
+        text = re.sub(r'\s+', ' ', text).strip()  # ลบ spaces ซ้ำ
+        
+        # ✅ ปรับปรุงข้อความด้วย PyThaiNLP ทันทีหลังจากได้ผลลัพธ์จาก OCR
+        if text.strip():
+            text = improve_thai_ocr_text(text)
+        
+        return text
+    except Exception as e:
+        error_msg = f"เกิดข้อผิดพลาดในการใช้ Typhoon OCR: {e}"
+        print(f"❌ {error_msg}")
+        raise RuntimeError(error_msg)
+    finally:
+        # ลบไฟล์ชั่วคราว
+        if tmp_path and os.path.exists(tmp_path):
             try:
-                # เรียกใช้ Typhoon OCR
-                ocr_document = get_ocr_reader.ocr_document
-                markdown_text = ocr_document(pdf_or_image_path=tmp_path)
-                
-                # แปลง markdown เป็น plain text (ลบ markdown syntax)
-                # ลบ markdown headers, bold, italic, etc.
-                text = re.sub(r'#+\s*', '', markdown_text)  # ลบ headers
-                text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # ลบ bold
-                text = re.sub(r'\*([^*]+)\*', r'\1', text)  # ลบ italic
-                text = re.sub(r'`([^`]+)`', r'\1', text)  # ลบ code
-                text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # ลบ links
-                text = re.sub(r'\n+', ' ', text)  # แทนที่ newlines ด้วย space
-                text = re.sub(r'\s+', ' ', text).strip()  # ลบ spaces ซ้ำ
-                
-                return text
-            finally:
-                # ลบไฟล์ชั่วคราว
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-        except Exception as e:
-            print(f"⚠️ Error using Typhoon OCR: {e}, falling back to EasyOCR")
-            # Fallback to EasyOCR
-            import easyocr
-            easyocr_reader = easyocr.Reader(['en', 'th'], gpu=False, verbose=False)
-            ocr_results = easyocr_reader.readtext(image_bytes)
-            ocr_text = " ".join([result[1] for result in ocr_results if result[2] > 0.3])
-            return ocr_text
-    else:
-        # ใช้ EasyOCR (fallback)
-        ocr_results = reader.readtext(image_bytes)
-        ocr_text = " ".join([result[1] for result in ocr_results if result[2] > 0.3])
-        return ocr_text
+                os.unlink(tmp_path)
+            except:
+                pass
 
 # ✅ ฟังก์ชันโหลด embedding model แบบ lazy loading
 def get_embedding_model():
-    """โหลด embedding model แบบ lazy loading"""
+    """โหลด embedding model แบบ lazy loading - ใช้โมเดล minishlab/potion-multilingual-128M"""
     if not hasattr(get_embedding_model, 'model'):
-        print("🔄 Loading embedding model...")
-        get_embedding_model.model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
-        print("✅ Embedding model loaded successfully")
+        model_name = "minishlab/potion-multilingual-128M"
+        print(f"🔄 กำลังโหลด embedding model: {model_name}...")
+        get_embedding_model.model = SentenceTransformer(model_name, device="cpu")
+        print(f"✅ โหลด embedding model สำเร็จ: {model_name}")
     return get_embedding_model.model
 
 # ✅ ฟังก์ชันสร้าง embedding สำหรับข้อความ
@@ -393,7 +430,7 @@ def create_text_embedding(text):
         embedding = model.encode(text, convert_to_numpy=True).tolist()
         return embedding
     except Exception as e:
-        print(f"⚠️ Error creating embedding: {e}")
+        print(f"⚠️ เกิดข้อผิดพลาดในการสร้าง embedding: {e}")
         return None
 
 # ✅ อ่านข้อความจาก PDF ด้วย PyMuPDF
@@ -454,30 +491,26 @@ def extract_images_with_ocr(path):
                         print(f"⚠️ ข้ามรูปเล็ก {img_index + 1} ({width}x{height})")
                         continue
                     
-                    # OCR (ใช้ Typhoon OCR)
-                    ocr_text = perform_ocr_on_image_bytes(image_bytes)
+                    # OCR (ใช้ Typhoon OCR - ปรับปรุงข้อความด้วย PyThaiNLP แล้ว)
+                    improved_text = perform_ocr_on_image_bytes(image_bytes)
                     
-                    if ocr_text.strip():
-                        # 🆕 ปรับปรุงข้อความด้วย PyThaiNLP
-                        improved_text = improve_thai_ocr_text(ocr_text)
-                        
+                    if improved_text.strip():
                         image_info = {
                             "page": page_num + 1,
                             "image_index": img_index + 1,
-                            "original_text": ocr_text.strip(),
+                            "text": improved_text,  # ข้อความที่ผ่านการปรับปรุงด้วย PyThaiNLP แล้ว
                             "improved_text": improved_text,
-                            "text": improved_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
                             "image_base64": base64.b64encode(image_bytes).decode("utf-8")
                         }
                         images_data.append(image_info)
                         
-                        print(f"✅ รูป {img_index + 1}: {len(improved_text)} ตัวอักษร")
+                        print(f"✅ รูป {img_index + 1}: {len(improved_text)} ตัวอักษร (ผ่านการปรับปรุงด้วย PyThaiNLP)")
                     
                     # ล้าง memory
                     del image, image_bytes
                     
                 except Exception as e:
-                    print(f"❗ Error processing image {img_index + 1} on page {page_num + 1}: {e}")
+                    print(f"❗ เกิดข้อผิดพลาดในการประมวลผลรูปภาพ {img_index + 1} ในหน้า {page_num + 1}: {e}")
                     continue
             
             # ตรวจสอบ memory หลังจากประมวลผลแต่ละหน้า
@@ -494,27 +527,40 @@ def extract_images_with_ocr(path):
     
     return images_data
 
-# 🆕 แปลงตารางเป็นข้อความด้วย camelot + PyThaiNLP
+# ✅ แปลงตารางเป็นข้อความด้วย camelot + PyThaiNLP (ใช้เฉพาะ camelot)
 def extract_tables_with_camelot(path):
     """
     แปลงตารางใน PDF เป็นข้อความด้วย camelot + PyThaiNLP
-    - ใช้ camelot เพื่อ extract ตาราง (แม่นยำกว่า pdfplumber)
-    - ใช้ PyThaiNLP ปรับปรุงข้อความ
+    - ใช้เฉพาะ camelot เพื่อ extract ตาราง (แม่นยำกว่า pdfplumber)
+    - ใช้ PyThaiNLP ปรับปรุงข้อความในแต่ละเซลล์และทั้งตาราง
+    - ลองใช้ flavor='lattice' ก่อน ถ้าไม่ได้ลอง 'stream'
     """
     print(f"📊 กำลังแปลงตารางเป็นข้อความด้วย Camelot จาก: {path}")
     tables_data = []
     
     if not CAMELOT_AVAILABLE:
-        print("⚠️ Camelot not available, falling back to pdfplumber")
-        return extract_tables_with_pdfplumber(path)
+        error_msg = "Camelot ไม่พร้อมใช้งาน กรุณาติดตั้ง camelot-py และ dependencies ที่เกี่ยวข้อง"
+        print(f"❌ {error_msg}")
+        raise RuntimeError(error_msg)
     
     try:
         # ใช้ camelot extract ตารางจาก PDF
-        # flavor='lattice' สำหรับตารางที่มีเส้นขอบ, 'stream' สำหรับตารางที่ไม่มีเส้นขอบ
+        # ลองใช้ flavor='lattice' ก่อน (สำหรับตารางที่มีเส้นขอบ)
+        # ถ้าไม่ได้ลอง 'stream' (สำหรับตารางที่ไม่มีเส้นขอบ)
         print("🔄 กำลัง extract ตารางด้วย Camelot...")
-        tables = camelot.read_pdf(path, pages='all', flavor='lattice')
-        
-        print(f"✅ พบ {len(tables)} ตาราง")
+        tables = []
+        try:
+            tables = camelot.read_pdf(path, pages='all', flavor='lattice')
+            print(f"✅ พบ {len(tables)} ตารางด้วย flavor='lattice'")
+        except Exception as e1:
+            print(f"⚠️ ไม่สามารถใช้ flavor='lattice' ได้: {e1}")
+            try:
+                tables = camelot.read_pdf(path, pages='all', flavor='stream')
+                print(f"✅ พบ {len(tables)} ตารางด้วย flavor='stream'")
+            except Exception as e2:
+                error_msg = f"ไม่สามารถ extract ตารางด้วย camelot (ทั้ง lattice และ stream): {e2}"
+                print(f"❌ {error_msg}")
+                raise RuntimeError(error_msg)
         
         for table_index, table in enumerate(tables):
             try:
@@ -527,26 +573,30 @@ def extract_tables_with_camelot(path):
                     # Fallback: แปลงเป็น list แบบง่ายๆ
                     table_data = [[str(cell) for cell in row] for row in table.df.values] if hasattr(table.df, 'values') else []
                 
-                # 🆕 ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
+                # ✅ ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
                 table_text = ""
                 for row in table_data:
                     if row:
-                        # ปรับปรุงข้อความในแต่ละเซลล์
+                        # ปรับปรุงข้อความในแต่ละเซลล์ด้วย improve_thai_ocr_text()
                         improved_cells = []
                         for cell in row:
                             cell_str = str(cell).strip() if cell is not None and str(cell).strip() else ""
-                            if cell_str and PYTHAINLP_AVAILABLE:
-                                improved_cell = improve_thai_ocr_text(cell_str)
+                            if cell_str:
+                                if PYTHAINLP_AVAILABLE:
+                                    # ✅ ใช้ improve_thai_ocr_text() เพื่อปรับปรุงข้อความในแต่ละเซลล์
+                                    improved_cell = improve_thai_ocr_text(cell_str)
+                                else:
+                                    improved_cell = cell_str
                                 improved_cells.append(improved_cell)
                             else:
-                                improved_cells.append(cell_str)
+                                improved_cells.append("")
                         
                         row_text = " | ".join(improved_cells)
                         if row_text.strip():
                             table_text += row_text + "\n"
                 
                 if table_text.strip():
-                    # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP (อีกครั้งเพื่อปรับปรุงโครงสร้าง)
+                    # ✅ ปรับปรุงข้อความในตารางด้วย PyThaiNLP (อีกครั้งเพื่อปรับปรุงโครงสร้าง)
                     improved_table_text = improve_thai_table_text(table_text.strip())
                     
                     # ดึงข้อมูลหน้า (camelot ใช้ 1-based page numbers)
@@ -562,64 +612,26 @@ def extract_tables_with_camelot(path):
                         "bbox": table._bbox if hasattr(table, '_bbox') else None
                     }
                     tables_data.append(table_info)
-                    print(f"   ✅ ตาราง {table_index + 1} (หน้า {page_num}): {len(improved_table_text)} ตัวอักษร")
+                    print(f"   ✅ ตาราง {table_index + 1} (หน้า {page_num}): {len(improved_table_text)} ตัวอักษร (ผ่านการปรับปรุงด้วย PyThaiNLP)")
                 
             except Exception as e:
-                print(f"   ⚠️ Error processing table {table_index + 1}: {e}")
+                print(f"   ⚠️ เกิดข้อผิดพลาดในการประมวลผลตาราง {table_index + 1}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         # ตรวจสอบ memory
         check_memory()
                     
     except Exception as e:
-        print(f"❗ Error extracting tables with Camelot: {e}")
-        print("   Falling back to pdfplumber...")
-        return extract_tables_with_pdfplumber(path)
+        error_msg = f"เกิดข้อผิดพลาดในการดึงตารางด้วย Camelot: {e}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(error_msg)
     
     return tables_data
 
-# ✅ แปลงตารางเป็นข้อความด้วย pdfplumber (fallback)
-def extract_tables_with_pdfplumber(path):
-    """
-    แปลงตารางใน PDF เป็นข้อความด้วย pdfplumber (fallback)
-    """
-    print(f"📊 กำลังแปลงตารางเป็นข้อความด้วย pdfplumber จาก: {path}")
-    tables_data = []
-    
-    try:
-        with pdfplumber.open(path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                tables = page.extract_tables()
-                for table_index, table in enumerate(tables):
-                    if table:
-                        # แปลงตารางเป็นข้อความ
-                        table_text = ""
-                        for row in table:
-                            if row:
-                                row_text = " | ".join([cell if cell else "" for cell in row])
-                                table_text += row_text + "\n"
-                        
-                        if table_text.strip():
-                            # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
-                            improved_table_text = improve_thai_table_text(table_text.strip())
-                            
-                            table_info = {
-                                "page": page_num + 1,
-                                "table_index": table_index + 1,
-                                "original_text": table_text.strip(),
-                                "improved_text": improved_table_text,
-                                "text": improved_table_text  # ใช้ข้อความที่ปรับปรุงแล้ว
-                            }
-                            tables_data.append(table_info)
-                
-                # ตรวจสอบ memory ทุก 10 หน้า
-                if page_num % 10 == 0:
-                    check_memory()
-                    
-    except Exception as e:
-        print(f"❗ Error extracting tables: {e}")
-    
-    return tables_data
 
 # ✅ บันทึกข้อมูลต้นฉบับลง MongoDB
 def store_original_data_in_mongodb(chunks, collection_name):
@@ -674,7 +686,7 @@ def store_original_data_in_mongodb(chunks, collection_name):
         client.close()
         
     except Exception as e:
-        print(f"❗ MongoDB Atlas connection failed: {e}")
+        print(f"❗ การเชื่อมต่อ MongoDB Atlas ล้มเหลว: {e}")
         print(f"💾 บันทึกลงไฟล์ JSON แทน...")
         
         # Fallback: บันทึกลงไฟล์ JSON
@@ -714,7 +726,7 @@ def store_original_to_json(chunks, collection_name):
         print(f"✅ บันทึกข้อมูลต้นฉบับ {len(original_chunks)} chunks ลง {filename}")
         
     except Exception as e:
-        print(f"❗ Error saving original data to JSON: {e}")
+        print(f"❗ เกิดข้อผิดพลาดในการบันทึกข้อมูลต้นฉบับเป็น JSON: {e}")
 
 # ✅ ฟังก์ชันประมวลผลหน้าเดียว (ตาม flow ที่ออกแบบ - เจออะไรก่อนทำอันนั้น)
 def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, pdf_path=None):
@@ -815,14 +827,28 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, 
                     }
                 })
         
-        # 1.3 ดึง Tables พร้อมตำแหน่ง (ใช้ camelot ถ้ามี, fallback เป็น pdfplumber)
+        # 1.3 ดึง Tables พร้อมตำแหน่ง (ใช้เฉพาะ camelot)
         tables_found = False
         
-        # 🆕 ลองใช้ camelot ก่อน (ถ้ามี)
-        if CAMELOT_AVAILABLE and pdf_path:
+        # ✅ ใช้เฉพาะ camelot (ต้องมี CAMELOT_AVAILABLE และ pdf_path)
+        if not CAMELOT_AVAILABLE:
+            print(f"   ⚠️ Camelot ไม่พร้อมใช้งาน - ข้ามการ extract ตาราง")
+        elif not pdf_path:
+            print(f"   ⚠️ ไม่มี pdf_path - ข้ามการ extract ตารางด้วย camelot")
+        else:
             try:
                 # ใช้ camelot extract ตารางจากหน้าเฉพาะ (camelot ใช้ 1-based page numbers)
-                camelot_tables = camelot.read_pdf(pdf_path, pages=str(page_num + 1), flavor='lattice')
+                # flavor='lattice' สำหรับตารางที่มีเส้นขอบ, 'stream' สำหรับตารางที่ไม่มีเส้นขอบ
+                # ลองใช้ 'lattice' ก่อน ถ้าไม่ได้ลอง 'stream'
+                camelot_tables = []
+                try:
+                    camelot_tables = camelot.read_pdf(pdf_path, pages=str(page_num + 1), flavor='lattice')
+                except:
+                    # ถ้า lattice ไม่ได้ ลอง stream
+                    try:
+                        camelot_tables = camelot.read_pdf(pdf_path, pages=str(page_num + 1), flavor='stream')
+                    except Exception as e2:
+                        print(f"   ⚠️ ไม่สามารถ extract ตารางด้วย camelot (ทั้ง lattice และ stream): {e2}")
                 
                 if len(camelot_tables) > 0:
                     print(f"   📊 พบ {len(camelot_tables)} ตารางด้วย Camelot")
@@ -839,26 +865,30 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, 
                                 # Fallback: แปลงเป็น list แบบง่ายๆ
                                 table_data = [[str(cell) for cell in row] for row in table.df.values] if hasattr(table.df, 'values') else []
                             
-                            # 🆕 ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
+                            # ✅ ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
                             table_text = ""
                             for row in table_data:
                                 if row:
-                                    # ปรับปรุงข้อความในแต่ละเซลล์
+                                    # ปรับปรุงข้อความในแต่ละเซลล์ด้วย improve_thai_ocr_text()
                                     improved_cells = []
                                     for cell in row:
                                         cell_str = str(cell).strip() if cell is not None and str(cell).strip() else ""
-                                        if cell_str and PYTHAINLP_AVAILABLE:
-                                            improved_cell = improve_thai_ocr_text(cell_str)
+                                        if cell_str:
+                                            if PYTHAINLP_AVAILABLE:
+                                                # ✅ ใช้ improve_thai_ocr_text() เพื่อปรับปรุงข้อความในแต่ละเซลล์
+                                                improved_cell = improve_thai_ocr_text(cell_str)
+                                            else:
+                                                improved_cell = cell_str
                                             improved_cells.append(improved_cell)
                                         else:
-                                            improved_cells.append(cell_str)
+                                            improved_cells.append("")
                                     
                                     row_text = " | ".join(improved_cells)
                                     if row_text.strip():
                                         table_text += row_text + "\n"
                             
                             if table_text.strip():
-                                # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
+                                # ✅ ปรับปรุงข้อความในตารางด้วย PyThaiNLP (อีกครั้งเพื่อปรับปรุงโครงสร้าง)
                                 improved_table_text = improve_thai_table_text(table_text.strip())
                                 
                                 # ดึง bbox จาก camelot
@@ -873,91 +903,22 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, 
                                         'text': improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
                                         'original_text': table_text.strip(),
                                         'improved_text': improved_table_text,
-                                        'bbox': bbox
+                                        'bbox': bbox,
+                                        'accuracy': float(table.accuracy) if hasattr(table, 'accuracy') else None
                                     }
                                 })
                         except Exception as e:
-                            print(f"   ⚠️ Error processing camelot table {table_index + 1}: {e}")
+                            print(f"   ⚠️ เกิดข้อผิดพลาดในการประมวลผลตาราง camelot {table_index + 1}: {e}")
+                            import traceback
+                            traceback.print_exc()
                             continue
-            except Exception as e:
-                print(f"   ⚠️ Error using Camelot: {e}, falling back to pdfplumber")
-                tables_found = False
-        
-        # Fallback: ใช้ pdfplumber ถ้า camelot ไม่ได้หรือไม่มี
-        if not tables_found and page_num < len(pdfplumber_pdf.pages):
-            pdfplumber_page = pdfplumber_pdf.pages[page_num]
-            
-            # พยายามหา bbox ของตาราง
-            try:
-                # ใช้ find_tables เพื่อได้ bbox (ถ้ามี)
-                if hasattr(pdfplumber_page, 'find_tables'):
-                    table_objects = pdfplumber_page.find_tables()
-                    
-                    for table_index, table_obj in enumerate(table_objects):
-                        if table_obj and hasattr(table_obj, 'bbox'):
-                            bbox = table_obj.bbox
-                            y_pos = bbox[1] if isinstance(bbox, (list, tuple)) else getattr(bbox, 'y0', bbox[1])
-                            
-                            # แปลงตารางเป็นข้อความ
-                            table = table_obj.extract() if hasattr(table_obj, 'extract') else None
-                            table_text = ""
-                            if table:
-                                for row in table:
-                                    if row:
-                                        row_text = " | ".join([cell if cell else "" for cell in row])
-                                        table_text += row_text + "\n"
-                            
-                            if table_text.strip():
-                                # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
-                                improved_table_text = improve_thai_table_text(table_text.strip())
-                                
-                                elements.append({
-                                    'type': 'table',
-                                    'y_pos': y_pos,
-                                    'data': {
-                                        'table_index': table_index,
-                                        'text': improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
-                                        'original_text': table_text.strip(),
-                                        'improved_text': improved_table_text,
-                                        'bbox': bbox
-                                    }
-                                })
                 else:
-                    raise AttributeError("find_tables not available")
+                    print(f"   ℹ️ ไม่พบตารางในหน้า {page_num + 1} ด้วย Camelot")
             except Exception as e:
-                # Fallback: ถ้า find_tables ไม่ได้ ให้ใช้ extract_tables แบบเดิม
-                print(f"⚠️ ไม่สามารถใช้ find_tables ได้: {e}, ใช้ extract_tables แทน")
-                tables = pdfplumber_page.extract_tables()
-                
-                # ประมาณตำแหน่งตารางจากตำแหน่งของ text และ image elements ที่มีอยู่
-                existing_y_positions = [e['y_pos'] for e in elements]
-                base_y_pos = max(existing_y_positions) if existing_y_positions else 500  # เริ่มที่ 500 ถ้าไม่มี elements อื่น
-                
-                for table_index, table in enumerate(tables):
-                    if table:
-                        table_text = ""
-                        for row in table:
-                            if row:
-                                row_text = " | ".join([cell if cell else "" for cell in row])
-                                table_text += row_text + "\n"
-                        
-                        if table_text.strip():
-                            # 🆕 ปรับปรุงข้อความในตารางด้วย PyThaiNLP
-                            improved_table_text = improve_thai_table_text(table_text.strip())
-                            
-                            # ประมาณตำแหน่งตาราง (ถัดจาก elements อื่นๆ)
-                            table_y_pos = base_y_pos + (table_index * 150)
-                            elements.append({
-                                'type': 'table',
-                                'y_pos': table_y_pos,
-                                'data': {
-                                    'table_index': table_index,
-                                    'text': improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
-                                    'original_text': table_text.strip(),
-                                    'improved_text': improved_table_text,
-                                    'bbox': None
-                                }
-                            })
+                print(f"   ❌ เกิดข้อผิดพลาดในการใช้ Camelot: {e}")
+                import traceback
+                traceback.print_exc()
+                tables_found = False
         
         # === STEP 2: เรียงลำดับ elements ตาม y-coordinate (จากบนลงล่าง) ===
         elements.sort(key=lambda x: x['y_pos'])
@@ -1180,25 +1141,22 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, 
                         del image, image_bytes
                         continue
                     
-                    # OCR (ใช้ Typhoon OCR)
+                    # OCR (ใช้ Typhoon OCR - ปรับปรุงข้อความด้วย PyThaiNLP แล้ว)
                     print(f"   🔍 กำลังทำ OCR...")
-                    ocr_text = perform_ocr_on_image_bytes(image_bytes)
+                    improved_text = perform_ocr_on_image_bytes(image_bytes)
                     
-                    if ocr_text.strip():
+                    if improved_text.strip():
                         page_results['has_content'] = True
-                        # ปรับปรุงข้อความด้วย PyThaiNLP
-                        improved_text = improve_thai_ocr_text(ocr_text)
                         
-                        print(f"   🖼️ Image {img_index + 1}: {len(improved_text)} ตัวอักษร (OCR: {len(ocr_text)} ตัวอักษร)")
+                        print(f"   🖼️ Image {img_index + 1}: {len(improved_text)} ตัวอักษร (ผ่านการปรับปรุงด้วย PyThaiNLP)")
                         
                         # Create image chunk
                         image_chunk = {
-                            "text": improved_text,
+                            "text": improved_text,  # ข้อความที่ผ่านการปรับปรุงด้วย PyThaiNLP แล้ว
                             "type": "image",
                             "chunk_id": image_chunk_counter,
                             "page": page_num + 1,
                             "image_index": img_index + 1,
-                            "original_text": ocr_text.strip(),
                             "improved_text": improved_text,
                             "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
                             "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_img_{img_index + 1}",
@@ -1213,7 +1171,7 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, 
                     del image, image_bytes
                     
                 except Exception as e:
-                    print(f"   ❗ Error processing image {img_index + 1}: {e}")
+                    print(f"   ❗ เกิดข้อผิดพลาดในการประมวลผลรูปภาพ {img_index + 1}: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
@@ -1265,7 +1223,7 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, 
         return page_results
         
     except Exception as e:
-        print(f"❗ Error processing page {page_num + 1}: {e}")
+        print(f"❗ เกิดข้อผิดพลาดในการประมวลผลหน้า {page_num + 1}: {e}")
         import traceback
         traceback.print_exc()
         return page_results
@@ -1351,7 +1309,7 @@ def store_page_results_to_mongodb(page_results, client, is_first_page=False):
         return True
         
     except Exception as e:
-        print(f"❗ Error storing page results to MongoDB: {e}")
+        print(f"❗ เกิดข้อผิดพลาดในการบันทึกผลลัพธ์หน้าไปยัง MongoDB: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -1453,7 +1411,7 @@ def main():
         print(f"   - Database: {ORIGINAL_DB_NAME}")
         
     except Exception as e:
-        print(f"❗ Error in main pipeline: {e}")
+        print(f"❗ เกิดข้อผิดพลาดใน main pipeline: {e}")
         import traceback
         traceback.print_exc()
         print("🔄 Running garbage collection...")

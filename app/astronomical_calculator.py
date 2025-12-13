@@ -6,7 +6,7 @@ import os
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
-from config import SUMMARY_DB_NAME
+from .multimodel_rag import ORIGINAL_DB_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +46,9 @@ class AstronomicalCalculator:
             mongo_uri = os.getenv("MONGO_URL")
             if mongo_uri and mongo_uri != "mongodb+srv://your-username:your-password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority":
                 self._mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
-                self._mongo_db = self._mongo_client[SUMMARY_DB_NAME]
+                self._mongo_db = self._mongo_client[ORIGINAL_DB_NAME]
         except Exception as conn_err:
-            logger.warning(f"Could not initialize MongoDB client: {conn_err}")
+            logger.warning(f"ไม่สามารถเริ่มต้น MongoDB client ได้: {conn_err}")
 
     def _get_collection(self, name: str):
         """คืนค่า collection จาก MongoDB หากพร้อมใช้งาน มิฉะนั้นคืนค่า None"""
@@ -95,7 +95,7 @@ class AstronomicalCalculator:
             }
             
         except Exception as e:
-            logger.error(f"Error calculating ascendant: {e}")
+            logger.error(f"เกิดข้อผิดพลาดในการคำนวณ Ascendant: {e}")
             return None
 
     def _calculate_lst(self, birth_datetime: datetime, longitude: float) -> float:
@@ -257,7 +257,7 @@ class AstronomicalCalculator:
                     elif isinstance(doc.get('text'), str) and doc['text'].strip():
                         interpretation_text = doc['text'].strip()
         except Exception as db_err:
-            logger.warning(f"Could not fetch ascendant interpretation from DB: {db_err}")
+            logger.warning(f"ไม่สามารถดึงการตีความ Ascendant จากฐานข้อมูลได้: {db_err}")
 
         if not interpretation_text:
             interpretation_text = "การตีความลัคณาจะดึงจากฐานข้อมูลเมื่อมีการตั้งค่า"
@@ -310,7 +310,7 @@ class AstronomicalCalculator:
             return houses
             
         except Exception as e:
-            logger.error(f"Error calculating house cusps: {e}")
+            logger.error(f"เกิดข้อผิดพลาดในการคำนวณ house cusps: {e}")
             return None
 
     def get_house_interpretation(self, house_number: int, house_data: Dict) -> str:
@@ -344,7 +344,7 @@ class AstronomicalCalculator:
                             meaning = doc[key].strip()
                             break
         except Exception as db_err:
-            logger.warning(f"Could not fetch house interpretation from DB: {db_err}")
+            logger.warning(f"ไม่สามารถดึงการตีความบ้านจากฐานข้อมูลได้: {db_err}")
 
         if not meaning:
             meaning = "คำอธิบายบ้านจะดึงจากฐานข้อมูลเมื่อมีการตั้งค่า"

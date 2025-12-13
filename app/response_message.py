@@ -13,6 +13,10 @@ from .retrieval_utils import ask_question_to_rag, store_user_response, store_use
 from .birth_date_parser import extract_birth_date_from_message, generate_birth_chart_prediction, detect_zodiac_sign_in_message
 # ใช้ฟังก์ชัน Content Filter
 from .content_filter import check_content_safety
+from .multimodel_rag import ORIGINAL_DB_NAME
+
+# Database สำหรับเก็บข้อมูลผู้ใช้ (user_profiles และ responses)
+USER_DB_NAME = "astrobot"
 
 load_dotenv()
 
@@ -39,7 +43,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
 
     try:
         client = MongoClient(mongo_uri)
-        collection = client["astrobot"]["user_profiles"]
+        collection = client[USER_DB_NAME]["user_profiles"]
 
         user = collection.find_one({"user_id": user_id})
         logger.info(f"🔎 User found: {user is not None}")
@@ -97,7 +101,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                         else:
                             logger.warning(f"ไม่สามารถสร้างคำทำนายดวงกำเนิดได้: {birth_chart_prediction}")
                     except Exception as e:
-                        logger.warning(f"Error generating birth chart prediction: {e}")
+                        logger.warning(f"เกิดข้อผิดพลาดในการสร้างคำทำนายดวงกำเนิด: {e}")
                 
                 # สร้างข้อมูลดวงชะตาเพื่อแสดงข้อมูล Ascendant (ถ้ามีเวลาเกิด)
                 ascendant_info = ""
@@ -125,7 +129,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
 {chart_info.get('ascendant_interpretation', '')}"""
                             logger.info(f"✅ Generated ascendant info: {ascendant['sign']} {ascendant['degree']:.1f}°")
                 except Exception as e:
-                    logger.warning(f"Error generating ascendant info: {e}")
+                    logger.warning(f"เกิดข้อผิดพลาดในการสร้างข้อมูล Ascendant: {e}")
 
                 # ตอบคำถามโหราศาสตร์ทันที
                 try:
@@ -168,7 +172,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                         astrology_answer += ascendant_info
                         logger.info("✅ Added ascendant info to astrology answer")
                     elif ascendant_info and is_error_message:
-                        logger.info("⚠️ Skipped adding ascendant info due to error message")
+                        logger.info("⚠️ ข้ามการเพิ่มข้อมูล Ascendant เนื่องจากเป็นข้อความข้อผิดพลาด")
                     
                     # บันทึกเฉพาะคำตอบสุดท้ายเท่านั้น (astrology_answer) จะถูกบันทึกโดยชั้นล่างใน ask_question_to_rag
                     # อัปเดตบริบทคำถามล่าสุดไว้ในโปรไฟล์
@@ -181,7 +185,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                     # log_pretty_answer(user_id, "astrology_qa", astrology_answer)
                     return astrology_answer
                 except Exception as e:
-                    logger.warning(f"Could not get astrology answer: {e}")
+                    logger.warning(f"ไม่สามารถรับคำตอบโหราศาสตร์ได้: {e}")
                     
                     welcome_message = f"""ขอบคุณที่ให้ข้อมูลครับ!
 วันเกิดของคุณ: {birth_date}{ascendant_info}
@@ -274,7 +278,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
             return welcome_message
             
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        logger.error(f"ข้อผิดพลาดฐานข้อมูล: {e}")
         error_message = "ขออภัยครับ เกิดปัญหาในระบบ กรุณาลองใหม่อีกครั้ง"
         
         # บันทึกคำถามใน user_profiles
@@ -304,7 +308,7 @@ def generate_reply_message(event):
     # ตรวจสอบความปลอดภัยของเนื้อหาก่อน
     is_safe, safety_message = check_content_safety(user_text)
     if not is_safe:
-        logger.warning(f"Content filtered for user {user_id}: {safety_message}")
+        logger.warning(f"กรองเนื้อหาสำหรับผู้ใช้ {user_id}: {safety_message}")
         
         # บันทึกคำถามใน user_profiles
         store_user_question(
@@ -415,12 +419,12 @@ def generate_reply_message(event):
                 reply_text = ask_question_to_rag(user_text, user_id=user_id)
             # ป้องกันกรณีที่คำตอบไม่ใช่สตริง หรือเป็น None
             if not isinstance(reply_text, str):
-                logger.warning(f"reply_text is not str (type={type(reply_text)}), coercing to string")
+                logger.warning(f"reply_text ไม่ใช่ str (type={type(reply_text)}), แปลงเป็น string")
                 reply_text = "" if reply_text is None else str(reply_text)
             logger.info(f"ได้รับคำตอบ (ความยาว: {len(reply_text)} ตัวอักษร)")
     except Exception as e:
         import traceback
-        logger.error(f"Error in processing: {e}")
+        logger.error(f"เกิดข้อผิดพลาดในการประมวลผล: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         # บันทึกบริบทสำคัญช่วยดีบัก
         try:
