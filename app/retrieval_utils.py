@@ -1225,7 +1225,7 @@ def check_follow_up_question_with_llm(question: str, user_context: dict = None) 
             # ถ้า semantic similarity ก็ error ให้ return False
             return False
 
-def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_info: dict = None) -> str:
+def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_info: dict = None, return_retrieved_contexts: bool = False):
     # print(f"\n=== เริ่มการค้นหาข้อมูลสำหรับคำถาม: {question} ===")
     
     # เก็บคำถามเดิมไว้
@@ -1237,6 +1237,8 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
     is_allowed, current_count, limit_message = check_and_update_question_limit(user_id)
     if not is_allowed:
         logger.info(f"🚫 Question limit exceeded for user {user_id}: {current_count}/3")
+        if return_retrieved_contexts:
+            return limit_message, []
         return limit_message
     
     # ดึงข้อมูลบริบทการสนทนาของผู้ใช้ก่อน
@@ -1721,7 +1723,7 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
                                 
                                 # 🆕 คำนวณ threshold ก่อน (ลด threshold เพื่อให้ได้ข้อมูลมากขึ้น)
                                 # ใช้ threshold ที่ต่ำกว่าเพื่อให้ได้ข้อมูลที่เกี่ยวข้องมากขึ้น
-                                threshold = 0.5000 if (birth_info_from_question and birth_info_from_question.get('date')) else 0.5000
+                                threshold = 0.3500 if (birth_info_from_question and birth_info_from_question.get('date')) else 0.3500
                                 
                                 # แสดง similarity score สูงสุด
                                 if top_docs:
@@ -1840,6 +1842,10 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         except Exception:
             pass
         
+        if return_retrieved_contexts:
+            # Return all retrieved docs even if below threshold, or just empty?
+            # Ragas uses retrieved contexts. If we found nothing relevant (>0.5), we return empty list.
+            return answer, []
         return answer
 
     # ✅ ใช้ RAG system - ใช้ข้อมูลจาก MongoDB ที่ค้นหาด้วย cosine similarity
@@ -1853,6 +1859,8 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         openai_key = os.getenv("OPENAI_API_KEY")
         if not openai_key or openai_key == "your-openai-api-key-here":
             # ถ้าไม่ตั้งค่า API key ให้ตอบแบบ fallback ทั่วไปแทนการเรียก LLM
+            if return_retrieved_contexts:
+                return "ขออภัยค่ะ ตอนนี้ระบบยังไม่พร้อมใช้งาน AI ภายนอก แต่คุณสามารถถามเกี่ยวกับราศีได้ตามปกติ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์'", []
             return "ขออภัยค่ะ ตอนนี้ระบบยังไม่พร้อมใช้งาน AI ภายนอก แต่คุณสามารถถามเกี่ยวกับราศีได้ตามปกติ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์'"
         client = OpenAI(api_key=openai_key)
         
@@ -2608,5 +2616,9 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         pass
 
     # print(f"=== ส่งคำตอบให้ผู้ใช้: {user_id} ===\n")
-    return answer
+    if return_retrieved_contexts:
+        # Return list of texts
+        # Note: valid_retrieved_docs matches the contexts used for generation
+        contexts = [d.get('text', '') for d in valid_retrieved_docs] if 'valid_retrieved_docs' in locals() else []
+        return answer, contexts
     return answer

@@ -13,6 +13,8 @@ import gc
 import psutil
 import re
 from sentence_transformers import SentenceTransformer
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 
 # 🆕 เพิ่ม camelot สำหรับ extract ตาราง
 try:
@@ -81,6 +83,21 @@ def convert_bbox_to_mongodb_format(bbox):
     except Exception as e:
         print(f"   ⚠️ เกิดข้อผิดพลาดในการแปลง bbox: {e}")
         return None
+
+# ✅ ฟังก์ชันสำหรับตัดข้อความเป็น Chunks
+def chunk_text_content(text):
+    """
+    ตัดข้อความเป็น Chunks โดยใช้ RecursiveCharacterTextSplitter
+    - รองรับภาษาไทย (ใช้ separators ที่เหมาะสม)
+    - ขนาด chunk 1000 characters, overlap 200
+    """
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    return text_splitter.split_text(text)
 
 # ✅ ฟังก์ชันตรวจสอบ memory
 def check_memory():
@@ -458,132 +475,122 @@ def extract_text_with_pymupdf(path):
     return text_output
 
 # ✅ แปลงรูปภาพเป็นข้อความด้วย OCR + PyThaiNLP (ปรับปรุง memory management)
-def extract_images_with_ocr(path):
+def extract_images_from_page(page_num, pymupdf_page, doc):
     """
-    แปลงรูปภาพใน PDF เป็นข้อความด้วย OCR + PyThaiNLP
+    แปลงรูปภาพใน PDF เป็นข้อความด้วย OCR + PyThaiNLP (สำหรับหน้าเดียว)
     """
-    print(f"🖼️ กำลังแปลงรูปภาพเป็นข้อความจาก: {path}")
     images_data = []
-    doc = fitz.open(path)
     
     try:
-        for page_num, page in enumerate(doc):
-            images = page.get_images(full=True)
-            print(f"หน้า {page_num + 1}: {len(images)} รูป")
-            
-            for img_index, img in enumerate(images):
-                try:
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    
-                    # ตรวจสอบขนาดรูปภาพ
-                    image = Image.open(io.BytesIO(image_bytes))
-                    width, height = image.size
-                    
-                    # ข้ามรูปที่ใหญ่เกินไป
-                    if width * height > 1500000:  # 1.5M pixels
-                        print(f"⚠️ ข้ามรูปใหญ่ {img_index + 1} ({width}x{height})")
-                        continue
-                    
-                    # ข้ามรูปที่เล็กเกินไป
-                    if width < 50 or height < 50:
-                        print(f"⚠️ ข้ามรูปเล็ก {img_index + 1} ({width}x{height})")
-                        continue
-                    
-                    # OCR (ใช้ Typhoon OCR - ปรับปรุงข้อความด้วย PyThaiNLP แล้ว)
-                    improved_text = perform_ocr_on_image_bytes(image_bytes)
-                    
-                    if improved_text.strip():
-                        image_info = {
-                            "page": page_num + 1,
-                            "image_index": img_index + 1,
-                            "text": improved_text,  # ข้อความที่ผ่านการปรับปรุงด้วย PyThaiNLP แล้ว
-                            "improved_text": improved_text,
-                            "image_base64": base64.b64encode(image_bytes).decode("utf-8")
-                        }
-                        images_data.append(image_info)
-                        
-                        print(f"✅ รูป {img_index + 1}: {len(improved_text)} ตัวอักษร (ผ่านการปรับปรุงด้วย PyThaiNLP)")
-                    
-                    # ล้าง memory
-                    del image, image_bytes
-                    
-                except Exception as e:
-                    print(f"❗ เกิดข้อผิดพลาดในการประมวลผลรูปภาพ {img_index + 1} ในหน้า {page_num + 1}: {e}")
-                    continue
-            
-            # ตรวจสอบ memory หลังจากประมวลผลแต่ละหน้า
-            if page_num % 5 == 0:
-                check_memory()
-            
-            # จำกัดจำนวนรูปต่อหน้า
-            if len(images_data) > 50:  # จำกัดไม่เกิน 50 รูป
-                print("⚠️ จำกัดจำนวนรูปที่ 50 รูป")
-                break
+        images = pymupdf_page.get_images(full=True)
+        if images:
+            print(f"   🖼️ หน้า {page_num}: พบ {len(images)} รูป")
+        
+        for img_index, img in enumerate(images):
+            try:
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
                 
-    finally:
-        doc.close()
-    
+                # ตรวจสอบขนาดรูปภาพ
+                image = Image.open(io.BytesIO(image_bytes))
+                width, height = image.size
+                
+                # ข้ามรูปที่ใหญ่เกินไป
+                if width * height > 1500000:  # 1.5M pixels
+                    print(f"      ⚠️ ข้ามรูปใหญ่ {img_index + 1} ({width}x{height})")
+                    continue
+                
+                # ข้ามรูปที่เล็กเกินไป
+                if width < 50 or height < 50:
+                    print(f"      ⚠️ ข้ามรูปเล็ก {img_index + 1} ({width}x{height})")
+                    continue
+                
+                # OCR (ใช้ Typhoon OCR - ปรับปรุงข้อความด้วย PyThaiNLP แล้ว)
+                improved_text = perform_ocr_on_image_bytes(image_bytes)
+                
+                if improved_text.strip():
+                    image_info = {
+                        "page": page_num,
+                        "image_index": img_index + 1,
+                        "text": improved_text,  # ข้อความที่ผ่านการปรับปรุงด้วย PyThaiNLP แล้ว
+                        "improved_text": improved_text,
+                        "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
+                         "type": "image", # Add type
+                         "metadata": {
+                            "source": "image_ocr",
+                            "page": page_num
+                        }
+                    }
+                    images_data.append(image_info)
+                    
+                    print(f"      ✅ รูป {img_index + 1}: {len(improved_text)} ตัวอักษร (OCR)")
+                
+                # ล้าง memory
+                del image, image_bytes
+                
+            except Exception as e:
+                print(f"      ❗ เกิดข้อผิดพลาดในการประมวลผลรูปภาพ {img_index + 1} ในหน้า {page_num}: {e}")
+                continue
+        
+        # จำกัดจำนวนรูปต่อหน้า
+        if len(images_data) > 20:  # จำกัดไม่เกิน 20 รูปต่อหน้า
+            print("      ⚠️ จำกัดจำนวนรูปที่ 20 รูปต่อหน้า")
+            images_data = images_data[:20]
+            
+    except Exception as e:
+         print(f"   ❗ เกิดข้อผิดพลาดในการดึงรูปภาพหน้า {page_num}: {e}")
+
     return images_data
 
 # ✅ แปลงตารางเป็นข้อความด้วย camelot + PyThaiNLP (ใช้เฉพาะ camelot)
-def extract_tables_with_camelot(path):
+def extract_tables_from_page(path, page_num):
     """
-    แปลงตารางใน PDF เป็นข้อความด้วย camelot + PyThaiNLP
-    - ใช้เฉพาะ camelot เพื่อ extract ตาราง (แม่นยำกว่า pdfplumber)
-    - ใช้ PyThaiNLP ปรับปรุงข้อความในแต่ละเซลล์และทั้งตาราง
-    - ลองใช้ flavor='lattice' ก่อน ถ้าไม่ได้ลอง 'stream'
+    แปลงตารางใน PDF เป็นข้อความด้วย camelot + PyThaiNLP (สำหรับหน้าเดียว)
     """
-    print(f"📊 กำลังแปลงตารางเป็นข้อความด้วย Camelot จาก: {path}")
     tables_data = []
     
     if not CAMELOT_AVAILABLE:
-        error_msg = "Camelot ไม่พร้อมใช้งาน กรุณาติดตั้ง camelot-py และ dependencies ที่เกี่ยวข้อง"
-        print(f"❌ {error_msg}")
-        raise RuntimeError(error_msg)
+        # Silently fail or simple print if not available, as handled in top level
+        # But we already checked imports.
+        return []
     
     try:
-        # ใช้ camelot extract ตารางจาก PDF
-        # ลองใช้ flavor='lattice' ก่อน (สำหรับตารางที่มีเส้นขอบ)
-        # ถ้าไม่ได้ลอง 'stream' (สำหรับตารางที่ไม่มีเส้นขอบ)
-        print("🔄 กำลัง extract ตารางด้วย Camelot...")
+        # ใช้ camelot extract ตารางจาก PDF เฉพาะหน้านั้น
+        # camelot pages argument accepts strings like '1', '1-5', etc.
+        # page_num is 1-based index for camelot
+        
         tables = []
         try:
-            tables = camelot.read_pdf(path, pages='all', flavor='lattice')
-            print(f"✅ พบ {len(tables)} ตารางด้วย flavor='lattice'")
+            # Suppress stdout from camelot if possible or just let it print
+            tables = camelot.read_pdf(path, pages=str(page_num), flavor='lattice')
         except Exception as e1:
-            print(f"⚠️ ไม่สามารถใช้ flavor='lattice' ได้: {e1}")
             try:
-                tables = camelot.read_pdf(path, pages='all', flavor='stream')
-                print(f"✅ พบ {len(tables)} ตารางด้วย flavor='stream'")
+                tables = camelot.read_pdf(path, pages=str(page_num), flavor='stream')
             except Exception as e2:
-                error_msg = f"ไม่สามารถ extract ตารางด้วย camelot (ทั้ง lattice และ stream): {e2}"
-                print(f"❌ {error_msg}")
-                raise RuntimeError(error_msg)
+                # ถ้าไม่เจอตารางหรือไม่ error ก็แค่ return empty
+                pass
         
+        if tables and len(tables) > 0:
+            print(f"   📊 หน้า {page_num}: พบ {len(tables)} ตาราง")
+
         for table_index, table in enumerate(tables):
             try:
-                # แปลงตารางเป็น list of lists (ไม่ใช้ pandas)
-                # camelot table.df เป็น DataFrame แต่เราจะแปลงเป็น list โดยใช้ .values.tolist()
+                # แปลงตารางเป็น list of lists
                 try:
-                    # camelot ใช้ pandas DataFrame อยู่แล้ว แต่เราไม่ต้อง import pandas
                     table_data = table.df.values.tolist()
                 except:
-                    # Fallback: แปลงเป็น list แบบง่ายๆ
                     table_data = [[str(cell) for cell in row] for row in table.df.values] if hasattr(table.df, 'values') else []
                 
                 # ✅ ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
                 table_text = ""
                 for row in table_data:
                     if row:
-                        # ปรับปรุงข้อความในแต่ละเซลล์ด้วย improve_thai_ocr_text()
                         improved_cells = []
                         for cell in row:
                             cell_str = str(cell).strip() if cell is not None and str(cell).strip() else ""
                             if cell_str:
                                 if PYTHAINLP_AVAILABLE:
-                                    # ✅ ใช้ improve_thai_ocr_text() เพื่อปรับปรุงข้อความในแต่ละเซลล์
                                     improved_cell = improve_thai_ocr_text(cell_str)
                                 else:
                                     improved_cell = cell_str
@@ -596,39 +603,30 @@ def extract_tables_with_camelot(path):
                             table_text += row_text + "\n"
                 
                 if table_text.strip():
-                    # ✅ ปรับปรุงข้อความในตารางด้วย PyThaiNLP (อีกครั้งเพื่อปรับปรุงโครงสร้าง)
                     improved_table_text = improve_thai_table_text(table_text.strip())
-                    
-                    # ดึงข้อมูลหน้า (camelot ใช้ 1-based page numbers)
-                    page_num = table.page if hasattr(table, 'page') else table_index + 1
                     
                     table_info = {
                         "page": page_num,
                         "table_index": table_index + 1,
                         "original_text": table_text.strip(),
                         "improved_text": improved_table_text,
-                        "text": improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
-                        "accuracy": float(table.accuracy) if hasattr(table, 'accuracy') else None,
-                        "bbox": table._bbox if hasattr(table, '_bbox') else None
+                        "text": improved_table_text,
+                        "bbox": table._bbox if hasattr(table, '_bbox') else None,
+                        "type": "table", # Add type
+                        "metadata": {
+                            "source": "table_camelot",
+                            "page": page_num
+                        }
                     }
                     tables_data.append(table_info)
-                    print(f"   ✅ ตาราง {table_index + 1} (หน้า {page_num}): {len(improved_table_text)} ตัวอักษร (ผ่านการปรับปรุงด้วย PyThaiNLP)")
+                    print(f"      ✅ ตาราง {table_index + 1}: {len(improved_table_text)} ตัวอักษร")
                 
             except Exception as e:
-                print(f"   ⚠️ เกิดข้อผิดพลาดในการประมวลผลตาราง {table_index + 1}: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"      ⚠️ เกิดข้อผิดพลาดในการประมวลผลตาราง {table_index + 1}: {e}")
                 continue
-        
-        # ตรวจสอบ memory
-        check_memory()
                     
     except Exception as e:
-        error_msg = f"เกิดข้อผิดพลาดในการดึงตารางด้วย Camelot: {e}"
-        print(f"❌ {error_msg}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(error_msg)
+        print(f"   ❗ เกิดข้อผิดพลาดในการดึงตารางหน้า {page_num}: {e}")
     
     return tables_data
 
@@ -728,26 +726,19 @@ def store_original_to_json(chunks, collection_name):
     except Exception as e:
         print(f"❗ เกิดข้อผิดพลาดในการบันทึกข้อมูลต้นฉบับเป็น JSON: {e}")
 
+        return text_chunks
+        
+    except Exception as e:
+        print(f"❗ เกิดข้อผิดพลาดในการประมวลผลหน้า {page_num + 1}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
 # ✅ ฟังก์ชันประมวลผลหน้าเดียว (ตาม flow ที่ออกแบบ - เจออะไรก่อนทำอันนั้น)
 def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, pdf_path=None):
     """
-    ประมวลผลหน้าเดียว: Extract → Store
-    🆕 แก้ไขให้ทำงานตามลำดับที่เจอในหน้า (เจออะไรก่อนทำอันนั้นก่อน) - เรียงตาม y-coordinate
-    
-    Args:
-        page_num: หมายเลขหน้าที่กำลังประมวลผล (0-based)
-        pymupdf_page: หน้า PDF จาก PyMuPDF
-        pdfplumber_pdf: PDF object จาก pdfplumber (fallback)
-        doc_id_counter: counter สำหรับสร้าง doc_id
-        pdf_path: path ของไฟล์ PDF (สำหรับใช้กับ camelot)
-        
-    Returns:
-        dict: {
-            'has_content': bool,  # มีเนื้อหาหรือไม่ (สำหรับตรวจสอบหน้าเปล่า)
-            'text_chunks': list,
-            'image_chunks': list,
-            'table_chunks': list
-        }
+    ประมวลผลหน้าเดียว: Extract → Clean → Chunk → Store
+    🆕 ใช้ RecursiveCharacterTextSplitter สำหรับ chunking
     """
     page_results = {
         'has_content': False,
@@ -758,475 +749,69 @@ def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, doc_id_counter, 
     
     try:
         print(f"\n{'='*50}")
-        print(f"📄 กำลังประมวลผลหน้า {page_num + 1} (ตามลำดับที่เจอ)")
+        print(f"📄 กำลังประมวลผลหน้า {page_num + 1}")
         print(f"{'='*50}")
         
-        # === STEP 1: รวบรวม elements ทั้งหมดพร้อมตำแหน่ง ===
-        elements = []  # เก็บ elements ทั้งหมดพร้อมตำแหน่ง y-coordinate
+        # ดึงข้อความทั้งหมดในหน้า
+        text = pymupdf_page.get_text("text")
+        if not text.strip():
+            print(f"⚠️ หน้า {page_num + 1} ไม่มีข้อความ")
+            return page_results
+
+        # Clean text เบื้องต้น
+        text = re.sub(r'\s+', ' ', text).strip()
         
-        # 1.1 ดึง Text Blocks พร้อมตำแหน่ง
-        text_blocks = pymupdf_page.get_text("blocks")  # Returns: [(x0, y0, x1, y1, text, block_no, block_type), ...]
-        for block in text_blocks:
-            if block[6] == 0:  # block_type = 0 คือ text block
-                x0, y0, x1, y1, text, block_no, block_type = block
-                if text.strip():
-                    elements.append({
-                        'type': 'text',
-                        'y_pos': y0,  # ใช้ y0 (ตำแหน่งบนสุด) สำหรับเรียงลำดับ
-                        'data': {
-                            'text': text.strip(),
-                            'bbox': (x0, y0, x1, y1),
-                            'block_no': block_no
-                        }
-                    })
+        # ใช้ improved_ocr logic ถ้ามี (optional) แต่นี่คือ text จาก PDF โดยตรง
+        # เราอาจจะข้าม improve_thai_ocr_text ถ้า PDF text อ่านได้ดีอยู่แล้ว
+        # แต่ถ้า PDF text แย่ อาจจะต้องใช้ OCR หรือ improve logic
         
-        # 1.2 ดึง Images พร้อมตำแหน่ง
-        images = pymupdf_page.get_images(full=True)
-        if images:
-            print(f"   🖼️ พบ {len(images)} รูปภาพในหน้านี้")
+        # ตัดแบ่ง Chunk
+        chunks = chunk_text_content(text)
+        print(f"   📝 หน้า {page_num + 1}: แบ่งได้ {len(chunks)} chunks")
         
-        for img_index, img in enumerate(images):
-            xref = img[0]
-            try:
-                # พยายามหา bbox ของรูปภาพจาก get_image_rects
-                y_pos = 0  # ค่าเริ่มต้น
-                bbox = None
-                try:
-                    from pymupdf.utils import get_image_rects
-                    image_rects = get_image_rects(pymupdf_page, xref)
-                    if image_rects:
-                        bbox = image_rects[0]  # ใช้ rect แรก
-                        if hasattr(bbox, 'y0'):
-                            y_pos = bbox.y0
-                        elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-                            y_pos = bbox[1]  # y0
-                except Exception as rect_error:
-                    # ถ้าไม่สามารถดึงตำแหน่งได้ ให้ประมาณจาก image list position
-                    # (รูปแรกจะอยู่ตำแหน่งบนสุดกว่า)
-                    y_pos = img_index * 100  # ประมาณตำแหน่ง
-                
-                elements.append({
-                    'type': 'image',
-                    'y_pos': y_pos,
-                    'data': {
-                        'xref': xref,
-                        'image_index': img_index,
-                        'bbox': bbox
-                    }
-                })
-            except Exception as e:
-                print(f"⚠️ ไม่สามารถดึงตำแหน่งรูป {img_index + 1} ได้: {e}")
-                # ถ้าไม่สามารถดึงตำแหน่งได้ ให้ใส่ตำแหน่ง 0 (จะอยู่แรกสุด)
-                elements.append({
-                    'type': 'image',
-                    'y_pos': img_index * 100,  # ประมาณตำแหน่ง
-                    'data': {
-                        'xref': xref,
-                        'image_index': img_index,
-                        'bbox': None
-                    }
-                })
-        
-        # 1.3 ดึง Tables พร้อมตำแหน่ง (ใช้เฉพาะ camelot)
-        tables_found = False
-        
-        # ✅ ใช้เฉพาะ camelot (ต้องมี CAMELOT_AVAILABLE และ pdf_path)
-        if not CAMELOT_AVAILABLE:
-            print(f"   ⚠️ Camelot ไม่พร้อมใช้งาน - ข้ามการ extract ตาราง")
-        elif not pdf_path:
-            print(f"   ⚠️ ไม่มี pdf_path - ข้ามการ extract ตารางด้วย camelot")
-        else:
-            try:
-                # ใช้ camelot extract ตารางจากหน้าเฉพาะ (camelot ใช้ 1-based page numbers)
-                # flavor='lattice' สำหรับตารางที่มีเส้นขอบ, 'stream' สำหรับตารางที่ไม่มีเส้นขอบ
-                # ลองใช้ 'lattice' ก่อน ถ้าไม่ได้ลอง 'stream'
-                camelot_tables = []
-                try:
-                    camelot_tables = camelot.read_pdf(pdf_path, pages=str(page_num + 1), flavor='lattice')
-                except:
-                    # ถ้า lattice ไม่ได้ ลอง stream
-                    try:
-                        camelot_tables = camelot.read_pdf(pdf_path, pages=str(page_num + 1), flavor='stream')
-                    except Exception as e2:
-                        print(f"   ⚠️ ไม่สามารถ extract ตารางด้วย camelot (ทั้ง lattice และ stream): {e2}")
-                
-                if len(camelot_tables) > 0:
-                    print(f"   📊 พบ {len(camelot_tables)} ตารางด้วย Camelot")
-                    tables_found = True
-                    
-                    for table_index, table in enumerate(camelot_tables):
-                        try:
-                            # แปลงตารางเป็น list of lists (ไม่ใช้ pandas)
-                            # camelot table.df เป็น DataFrame แต่เราจะแปลงเป็น list โดยใช้ .values.tolist()
-                            try:
-                                # camelot ใช้ pandas DataFrame อยู่แล้ว แต่เราไม่ต้อง import pandas
-                                table_data = table.df.values.tolist()
-                            except:
-                                # Fallback: แปลงเป็น list แบบง่ายๆ
-                                table_data = [[str(cell) for cell in row] for row in table.df.values] if hasattr(table.df, 'values') else []
-                            
-                            # ✅ ปรับปรุงข้อความในแต่ละเซลล์ด้วย PyThaiNLP
-                            table_text = ""
-                            for row in table_data:
-                                if row:
-                                    # ปรับปรุงข้อความในแต่ละเซลล์ด้วย improve_thai_ocr_text()
-                                    improved_cells = []
-                                    for cell in row:
-                                        cell_str = str(cell).strip() if cell is not None and str(cell).strip() else ""
-                                        if cell_str:
-                                            if PYTHAINLP_AVAILABLE:
-                                                # ✅ ใช้ improve_thai_ocr_text() เพื่อปรับปรุงข้อความในแต่ละเซลล์
-                                                improved_cell = improve_thai_ocr_text(cell_str)
-                                            else:
-                                                improved_cell = cell_str
-                                            improved_cells.append(improved_cell)
-                                        else:
-                                            improved_cells.append("")
-                                    
-                                    row_text = " | ".join(improved_cells)
-                                    if row_text.strip():
-                                        table_text += row_text + "\n"
-                            
-                            if table_text.strip():
-                                # ✅ ปรับปรุงข้อความในตารางด้วย PyThaiNLP (อีกครั้งเพื่อปรับปรุงโครงสร้าง)
-                                improved_table_text = improve_thai_table_text(table_text.strip())
-                                
-                                # ดึง bbox จาก camelot
-                                bbox = table._bbox if hasattr(table, '_bbox') else None
-                                y_pos = bbox[1] if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 2 else 500 + (table_index * 150)
-                                
-                                elements.append({
-                                    'type': 'table',
-                                    'y_pos': y_pos,
-                                    'data': {
-                                        'table_index': table_index,
-                                        'text': improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
-                                        'original_text': table_text.strip(),
-                                        'improved_text': improved_table_text,
-                                        'bbox': bbox,
-                                        'accuracy': float(table.accuracy) if hasattr(table, 'accuracy') else None
-                                    }
-                                })
-                        except Exception as e:
-                            print(f"   ⚠️ เกิดข้อผิดพลาดในการประมวลผลตาราง camelot {table_index + 1}: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            continue
-                else:
-                    print(f"   ℹ️ ไม่พบตารางในหน้า {page_num + 1} ด้วย Camelot")
-            except Exception as e:
-                print(f"   ❌ เกิดข้อผิดพลาดในการใช้ Camelot: {e}")
-                import traceback
-                traceback.print_exc()
-                tables_found = False
-        
-        # === STEP 2: เรียงลำดับ elements ตาม y-coordinate (จากบนลงล่าง) ===
-        elements.sort(key=lambda x: x['y_pos'])
-        
-        print(f"📊 พบ {len(elements)} elements: {len([e for e in elements if e['type']=='text'])} text, "
-              f"{len([e for e in elements if e['type']=='image'])} images, "
-              f"{len([e for e in elements if e['type']=='table'])} tables")
-        
-        # === STEP 2.5: รวม text blocks ที่อยู่ใกล้กัน (ในบรรทัดเดียวกันหรือใกล้กัน) ===
-        # 🆕 เพื่อแก้ปัญหาที่ text blocks ถูกแบ่งเป็น chunks เล็กเกินไป
-        text_elements = [e for e in elements if e['type'] == 'text']
-        if text_elements:
-            # 🆕 กลยุทธ์การรวม: รวม text blocks ที่อยู่ใกล้กันมากขึ้น
-            # ใช้ threshold ที่ใหญ่ขึ้น (50 pixels) และรวม chunks ที่สั้นมาก (< 100 ตัวอักษร) เข้าด้วยกัน
-            merged_text_chunks = []
-            current_chunk_texts = []
-            current_chunk_y_pos = None
-            current_chunk_bbox = None
-            Y_POS_THRESHOLD = 50  # 🆕 เพิ่มจาก 20 เป็น 50 pixels เพื่อรวม chunks ที่อยู่ห่างกันมากขึ้น
-            MAX_CHUNK_LENGTH = 2000  # 🆕 กำหนดขนาดสูงสุดของ chunk (2000 ตัวอักษร) เพื่อป้องกัน chunks ใหญ่เกินไป
-            
-            for text_elem in text_elements:
-                y_pos = text_elem['y_pos']
-                text_content = text_elem['data']['text']
-                bbox = text_elem['data'].get('bbox')
-                text_length = len(text_content) if text_content else 0
-                
-                # 🆕 ถ้า chunk สั้นมาก (< 100 ตัวอักษร) ให้รวมกับ chunk ก่อนหน้าเสมอ (ถ้ามี)
-                # หรือถ้า y_pos ใกล้กับ block ก่อนหน้า ให้รวมกัน
-                should_merge = False
-                if current_chunk_y_pos is None:
-                    should_merge = True  # block แรก
-                elif abs(y_pos - current_chunk_y_pos) <= Y_POS_THRESHOLD:
-                    should_merge = True  # y_pos ใกล้กัน
-                elif text_length < 100:
-                    # 🆕 ถ้า chunk สั้นมาก ให้รวมกับ chunk ก่อนหน้า (แม้ y_pos จะห่างกัน)
-                    # แต่ต้องไม่ห่างเกินไป (ภายใน 100 pixels)
-                    if abs(y_pos - current_chunk_y_pos) <= 100:
-                        should_merge = True
-                
-                if should_merge:
-                    # 🆕 ตรวจสอบว่าถ้ารวม text นี้เข้าไปแล้ว chunk จะใหญ่เกินไปหรือไม่
-                    potential_text = " ".join(current_chunk_texts + [text_content])
-                    if len(potential_text) > MAX_CHUNK_LENGTH:
-                        # ถ้า chunk จะใหญ่เกินไป ให้บันทึก chunk ปัจจุบันก่อน แล้วเริ่ม chunk ใหม่
-                        if current_chunk_texts:
-                            merged_text = " ".join(current_chunk_texts)
-                            merged_text_chunks.append({
-                                'text': merged_text,
-                                'y_pos': current_chunk_y_pos,
-                                'bbox': current_chunk_bbox
-                            })
-                        # เริ่ม chunk ใหม่ด้วย text ปัจจุบัน
-                        current_chunk_texts = [text_content]
-                        current_chunk_y_pos = y_pos
-                        current_chunk_bbox = bbox
-                    else:
-                        # ถ้า chunk ยังไม่ใหญ่เกินไป ให้รวม text นี้เข้าไป
-                        current_chunk_texts.append(text_content)
-                        if current_chunk_bbox is None:
-                            current_chunk_bbox = bbox
-                        current_chunk_y_pos = y_pos  # อัพเดท y_pos เป็นของ block ล่าสุด
-                else:
-                    # ถ้า y_pos ต่างกันมาก แสดงว่าเป็นย่อหน้าใหม่ - สร้าง chunk ใหม่
-                    if current_chunk_texts:
-                        merged_text = " ".join(current_chunk_texts)
-                        merged_text_chunks.append({
-                            'text': merged_text,
-                            'y_pos': current_chunk_y_pos,
-                            'bbox': current_chunk_bbox
-                        })
-                    # เริ่ม chunk ใหม่
-                    current_chunk_texts = [text_content]
-                    current_chunk_y_pos = y_pos
-                    current_chunk_bbox = bbox
-            
-            # เพิ่ม chunk สุดท้าย
-            if current_chunk_texts:
-                merged_text = " ".join(current_chunk_texts)
-                merged_text_chunks.append({
-                    'text': merged_text,
-                    'y_pos': current_chunk_y_pos,
-                    'bbox': current_chunk_bbox
-                })
-            
-            # 🆕 ถ้ายังมี chunks ที่สั้นมาก (< 100 ตัวอักษร) ให้รวมกับ chunks ที่อยู่ใกล้กัน
-            # รอบที่ 2: รวม chunks ที่สั้นมากกับ chunks ที่อยู่ใกล้กัน
-            final_merged_chunks = []
-            for i, chunk in enumerate(merged_text_chunks):
-                chunk_text = chunk['text']
-                chunk_length = len(chunk_text) if chunk_text else 0
-                chunk_y_pos = chunk['y_pos']
-                
-                # ถ้า chunk สั้นมาก (< 100 ตัวอักษร) และมี chunk ถัดไป ให้รวมกัน
-                if chunk_length < 100 and i < len(merged_text_chunks) - 1:
-                    next_chunk = merged_text_chunks[i + 1]
-                    next_y_pos = next_chunk['y_pos']
-                    next_text = next_chunk['text']
-                    next_length = len(next_text) if next_text else 0
-                    # ถ้า y_pos ใกล้กัน (ภายใน 100 pixels) ให้รวมกัน
-                    if abs(next_y_pos - chunk_y_pos) <= 100:
-                        # 🆕 ตรวจสอบว่าถ้ารวมแล้ว chunk จะใหญ่เกินไปหรือไม่
-                        combined_text = chunk_text + " " + next_text
-                        if len(combined_text) <= MAX_CHUNK_LENGTH:
-                            # รวมกับ chunk ถัดไป
-                            final_merged_chunks.append({
-                                'text': combined_text,
-                                'y_pos': chunk_y_pos,
-                                'bbox': chunk.get('bbox')
-                            })
-                            # ข้าม chunk ถัดไป (เพราะรวมแล้ว)
-                            merged_text_chunks[i + 1] = None  # mark as merged
-                        else:
-                            # ถ้า chunk จะใหญ่เกินไป ให้เก็บ chunk ปัจจุบันไว้
-                            final_merged_chunks.append(chunk)
-                    else:
-                        final_merged_chunks.append(chunk)
-                else:
-                    # ถ้า chunk นี้ถูก mark เป็น None (ถูกรวมไปแล้ว) ให้ข้าม
-                    if chunk is not None:
-                        final_merged_chunks.append(chunk)
-            
-            # กรอง None ออก
-            final_merged_chunks = [c for c in final_merged_chunks if c is not None]
-            
-            # แทนที่ text elements เดิมด้วย merged chunks
-            # ลบ text elements เดิมออกจาก elements list
-            elements = [e for e in elements if e['type'] != 'text']
-            # เพิ่ม merged text chunks กลับเข้าไป
-            for merged_chunk in final_merged_chunks:
-                elements.append({
-                    'type': 'text_merged',
-                    'y_pos': merged_chunk['y_pos'],
-                    'data': {
-                        'text': merged_chunk['text'],
-                        'bbox': merged_chunk.get('bbox')
-                    }
-                })
-            
-            # เรียงลำดับใหม่หลังจาก merge
-            elements.sort(key=lambda x: x['y_pos'])
-            print(f"🔄 รวม text blocks เป็น {len(final_merged_chunks)} chunks (จาก {len(text_elements)} blocks เดิม)")
-            
-            # 🆕 ตรวจสอบและแสดงสถิติของ chunks
-            chunk_lengths = [len(chunk['text']) for chunk in final_merged_chunks if chunk.get('text')]
-            if chunk_lengths:
-                avg_length = sum(chunk_lengths) / len(chunk_lengths)
-                max_length = max(chunk_lengths)
-                min_length = min(chunk_lengths)
-                chunks_over_limit = sum(1 for length in chunk_lengths if length > MAX_CHUNK_LENGTH)
-                
-                print(f"   📊 สถิติ chunks:")
-                print(f"      - จำนวน chunks: {len(final_merged_chunks)}")
-                print(f"      - ขนาดเฉลี่ย: {avg_length:.0f} ตัวอักษร")
-                print(f"      - ขนาดสูงสุด: {max_length} ตัวอักษร")
-                print(f"      - ขนาดต่ำสุด: {min_length} ตัวอักษร")
-                if chunks_over_limit > 0:
-                    print(f"      ⚠️ พบ {chunks_over_limit} chunks ที่ใหญ่เกิน {MAX_CHUNK_LENGTH} ตัวอักษร")
-                else:
-                    print(f"      ✅ ทุก chunks มีขนาดไม่เกิน {MAX_CHUNK_LENGTH} ตัวอักษร")
-            
-            for i, chunk in enumerate(final_merged_chunks[:5], 1):  # แสดง 5 อันดับแรก
-                chunk_length = len(chunk.get('text', ''))
-                size_indicator = " ⚠️ ใหญ่เกินไป" if chunk_length > MAX_CHUNK_LENGTH else ""
-                print(f"   📝 Merged chunk {i}: {chunk_length} ตัวอักษร{size_indicator}")
-        
-        # === STEP 3: ประมวลผลตามลำดับที่เรียงแล้ว (เจออะไรก่อนทำอันนั้นก่อน) ===
-        text_chunk_counter = 0
-        image_chunk_counter = 0
-        table_chunk_counter = 0
-        
-        for element_index, element in enumerate(elements):
-            element_type = element['type']
-            data = element['data']
-            
-            print(f"\n📌 Element {element_index + 1}/{len(elements)}: {element_type.upper()} "
-                  f"(y={element['y_pos']:.1f})")
-            
-            if element_type == 'text' or element_type == 'text_merged':
-                # ประมวลผล Text Block (ทั้งแบบเดิมและแบบ merged)
-                page_results['has_content'] = True
-                text_content = data['text']
-                print(f"   📝 Text: {len(text_content)} ตัวอักษร")
-                
-                text_chunk = {
-                    "text": text_content,
-                    "type": "text",
-                    "chunk_id": text_chunk_counter,
-                    "page": page_num + 1,
-                    "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_text_{text_chunk_counter}",
-                    "bbox": convert_bbox_to_mongodb_format(data['bbox'])
+        for i, chunk_text in enumerate(chunks):
+             chunk_info = {
+                "doc_id": doc_id_counter + i,
+                "page": page_num + 1,
+                "chunk_index": i + 1,
+                "text": chunk_text,
+                "type": "text",
+                "metadata": {
+                    "source": "pdf_text",
+                    "page": page_num + 1
                 }
-                page_results['text_chunks'].append(text_chunk)
-                text_chunk_counter += 1
-            
-            elif element_type == 'image':
-                # ประมวลผล Image
-                xref = data['xref']
-                img_index = data['image_index']
-                
-                try:
-                    print(f"   🖼️ กำลังประมวลผลรูปภาพ {img_index + 1}...")
-                    base_image = pymupdf_page.parent.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    
-                    # ตรวจสอบขนาดรูปภาพ
-                    image = Image.open(io.BytesIO(image_bytes))
-                    width, height = image.size
-                    print(f"   📏 ขนาดรูปภาพ: {width}x{height} pixels")
-                    
-                    # ข้ามรูปที่ใหญ่เกินไป
-                    if width * height > 1500000:
-                        print(f"   ⚠️ ข้ามรูปใหญ่ ({width}x{height}, {width*height:,} pixels > 1,500,000)")
-                        del image, image_bytes
-                        continue
-                    
-                    # ข้ามรูปที่เล็กเกินไป
-                    if width < 50 or height < 50:
-                        print(f"   ⚠️ ข้ามรูปเล็ก ({width}x{height} < 50x50)")
-                        del image, image_bytes
-                        continue
-                    
-                    # OCR (ใช้ Typhoon OCR - ปรับปรุงข้อความด้วย PyThaiNLP แล้ว)
-                    print(f"   🔍 กำลังทำ OCR...")
-                    improved_text = perform_ocr_on_image_bytes(image_bytes)
-                    
-                    if improved_text.strip():
-                        page_results['has_content'] = True
-                        
-                        print(f"   🖼️ Image {img_index + 1}: {len(improved_text)} ตัวอักษร (ผ่านการปรับปรุงด้วย PyThaiNLP)")
-                        
-                        # Create image chunk
-                        image_chunk = {
-                            "text": improved_text,  # ข้อความที่ผ่านการปรับปรุงด้วย PyThaiNLP แล้ว
-                            "type": "image",
-                            "chunk_id": image_chunk_counter,
-                            "page": page_num + 1,
-                            "image_index": img_index + 1,
-                            "improved_text": improved_text,
-                            "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
-                            "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_img_{img_index + 1}",
-                            "bbox": convert_bbox_to_mongodb_format(data['bbox'])
-                        }
-                        page_results['image_chunks'].append(image_chunk)
-                        image_chunk_counter += 1
-                    else:
-                        print(f"   ⚠️ ไม่พบข้อความในรูปภาพ {img_index + 1} (OCR ไม่เจอข้อความ) - ข้าม")
-                    
-                    # ล้าง memory
-                    del image, image_bytes
-                    
-                except Exception as e:
-                    print(f"   ❗ เกิดข้อผิดพลาดในการประมวลผลรูปภาพ {img_index + 1}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-            
-            elif element_type == 'table':
-                # ประมวลผล Table
-                # 🆕 ใช้ improved_text ถ้ามี (จาก camelot) ไม่งั้นใช้ text และปรับปรุง
-                table_text = data.get('original_text') or data.get('text', '')
-                improved_table_text = data.get('improved_text') or data.get('text', '')
-                table_index = data['table_index']
-                
-                # ถ้ายังไม่ได้ปรับปรุง ให้ปรับปรุงตอนนี้
-                if not data.get('improved_text'):
-                    improved_table_text = improve_thai_table_text(table_text)
-                
-                if improved_table_text.strip():
-                    page_results['has_content'] = True
-                    
-                    print(f"   📊 Table {table_index + 1}: {len(improved_table_text)} ตัวอักษร" + 
-                          (f" (ปรับปรุงแล้ว: {len(table_text)} → {len(improved_table_text)})" if table_text else ""))
-                    
-                    # Create table chunk
-                    table_chunk = {
-                        "text": improved_table_text,  # ใช้ข้อความที่ปรับปรุงแล้ว
-                        "type": "table",
-                        "chunk_id": table_chunk_counter,
-                        "page": page_num + 1,
-                        "table_index": table_index + 1,
-                        "original_text": table_text if table_text else improved_table_text,  # เก็บข้อความเดิมไว้ด้วย
-                        "improved_text": improved_table_text,  # เก็บข้อความที่ปรับปรุงแล้ว
-                        "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_table_{table_index + 1}",
-                        "bbox": convert_bbox_to_mongodb_format(data.get('bbox'))
-                    }
-                    page_results['table_chunks'].append(table_chunk)
-                    table_chunk_counter += 1
+            }
+             page_results['text_chunks'].append(chunk_info)
         
-        # สรุปผลการประมวลผลหน้า
-        if not page_results['has_content']:
-            print(f"⚠️ หน้า {page_num + 1} เป็นหน้าเปล่า (ไม่มี text, images, หรือ tables)")
-        else:
-            total_chunks = (len(page_results['text_chunks']) + 
-                          len(page_results['image_chunks']) + 
-                          len(page_results['table_chunks']))
-            print(f"\n✅ ประมวลผลหน้า {page_num + 1} เสร็จ: {total_chunks} chunks")
-            print(f"   📝 Text: {len(page_results['text_chunks'])} chunks")
-            print(f"   🖼️ Image: {len(page_results['image_chunks'])} chunks")
-            print(f"   📊 Table: {len(page_results['table_chunks'])} chunks")
+        page_results['has_content'] = True
+        
+        # Extract Images
+        if pymupdf_page:
+            image_chunks = extract_images_from_page(page_num + 1, pymupdf_page, pymupdf_page.parent)
+            if image_chunks:
+                for i, chunk in enumerate(image_chunks):
+                    # Add remaining necessary fields
+                    chunk["doc_id"] = doc_id_counter + len(page_results['text_chunks']) + i
+                    page_results['image_chunks'].append(chunk)
+
+        # Extract Tables
+        if pdf_path and CAMELOT_AVAILABLE:
+            table_chunks = extract_tables_from_page(pdf_path, page_num + 1)
+            if table_chunks:
+                for i, chunk in enumerate(table_chunks):
+                    # Add remaining necessary fields
+                    chunk["doc_id"] = doc_id_counter + len(page_results['text_chunks']) + len(page_results['image_chunks']) + i
+                    page_results['table_chunks'].append(chunk)
         
         return page_results
-        
+
     except Exception as e:
         print(f"❗ เกิดข้อผิดพลาดในการประมวลผลหน้า {page_num + 1}: {e}")
         import traceback
         traceback.print_exc()
         return page_results
+
+
 
 # ✅ ฟังก์ชันช่วยบันทึกข้อมูลทีละหน้า
 def store_page_results_to_mongodb(page_results, client, is_first_page=False):
