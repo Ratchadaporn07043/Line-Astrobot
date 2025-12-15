@@ -52,6 +52,7 @@ def main():
     # Limit for testing if needed, but user wants full evaluation probably.
     # The generation might take time and cost money.
     # I will process all items.
+    data = data[:10] # TEMPORARY LIMIT FOR VERIFICATION
     
     for i, item in enumerate(data):
         print(f"Processing {i+1}/{len(data)}...")
@@ -101,7 +102,7 @@ def main():
     
     # 2. Customize Faithfulness Prompts (Decomposition & NLI)
     # Use English for INSTRUCTIONS (better for JSON structure) but Thai for EXAMPLES (better for content)
-    faithfulness.statement_prompt.instruction = "Given a question and answer, create one or more statements from each sentence in the given answer. The statements must be in Thai."
+    faithfulness.statement_prompt.instruction = "จากคำถามและคำตอบที่ให้มา จงแยกประโยคย่อยๆ จากแต่ละประโยคในคำตอบ โดยข้อความต้องเป็นภาษาไทย และตอบกลับเป็น JSON ที่มีคีย์ 'statements' ตามตัวอย่าง"
     faithfulness.statement_prompt.examples = [
         {
             "question": "สีมงคลคืออะไร",
@@ -116,7 +117,7 @@ def main():
         }
     ]
     
-    faithfulness.nli_statements_message.instruction = "Natural language inference. Use only the provided context to verify if the statements are supported. Classify as 1 (True) or 0 (False)."
+    faithfulness.nli_statements_message.instruction = "การอนุมานภาษาธรรมชาติ ใช้เฉพาะบริบทที่ให้มาเพื่อตรวจสอบว่าข้อความได้รับการสนับสนุนหรือไม่ ให้จำแนกเป็น 1 (จริง) หรือ 0 (เท็จ)"
     faithfulness.nli_statements_message.examples = [
         {
             "context": "แมวเป็นสัตว์เลี้ยงลูกด้วยนมที่ชอบนอน",
@@ -137,7 +138,7 @@ def main():
     ]
 
     # 3. Customize Answer Relevancy Prompt
-    answer_relevancy.question_generation.instruction = "Generate a question for the given answer and identify if the answer is noncommittal. The question must be in Thai."
+    answer_relevancy.question_generation.instruction = "จงสร้างคำถามที่เป็นภาษาไทยจากคำตอบที่ให้มา คำถามต้องสั้น กระชับ และตรงประเด็น และต้องตอบกลับเป็น JSON format เท่านั้น โดยมี key คือ 'question' และ 'non_committal' (0 หรือ 1)"
     answer_relevancy.question_generation.examples = [
         {
             "answer": "สีแดงคือสีมงคล",
@@ -149,13 +150,20 @@ def main():
         }
     ]
     
+    # 4. Customize Context Precision and Recall Prompts
+    # Context Precision: Determine if context is relevant to the question
+    context_precision.context_precision_prompt.instruction = "จากคำถามและบริบทที่ให้มา (Context) จงระบุว่าบริบทนั้นมีความเกี่ยวข้องและมีประโยชน์ต่อการตอบคำถามหรือไม่ โดยเหตุผล (reason) ต้องเป็นภาษาไทย"
+    
+    # Context Recall: Determine if ground truth can be found in context
+    context_recall.context_recall_prompt.instruction = "จากบริบท (Context) และคำตอบที่ถูกต้อง (Ground Truth) จงวิเคราะห์ว่าแต่ละประโยคในคำตอบที่ถูกต้องนั้น สามารถอ้างอิงข้อมูลจากบริบทได้หรือไม่ โดยเหตุผล (reason) ต้องเป็นภาษาไทย"
+    
     # 4. Configure Ragas with Custom LLM (to handle 429s)
     print("Configuring LLM with retry logic...")
     from ragas.llms import LangchainLLMWrapper
     
     # Use ChatOpenAI with explicit retry configuration
     openai_model = ChatOpenAI(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         max_retries=10,
         timeout=60,
         api_key=os.getenv("OPENAI_API_KEY")

@@ -812,73 +812,22 @@ def generate_detailed_astrology_reading(message: str, latitude: float = None, lo
     # โหลดข้อมูลโหราศาสตร์รายละเอียด
     zodiac_sign = chart_info['zodiac_sign']
     
-    # ดึงข้อมูลราศีจาก MongoDB
-    zodiac_data = get_zodiac_data_from_mongodb(zodiac_sign)
-    if zodiac_data:
-        chart_info['detailed_reading'] = zodiac_data
-        logger.info(f"✅ Loaded zodiac data from MongoDB for {zodiac_sign}")
-    else:
-        logger.warning(f"⚠️ No MongoDB data found for {zodiac_sign}, falling back to JSON")
-        # Fallback to JSON if MongoDB fails
-        try:
-            zodiac_data_path = os.path.join(os.path.dirname(__file__), "..", "data", "zodiacData.json")
-            with open(zodiac_data_path, 'r', encoding='utf-8') as f:
-                json_zodiac_data = json.load(f)
-            if zodiac_sign in json_zodiac_data:
-                chart_info['detailed_reading'] = json_zodiac_data[zodiac_sign]
-        except Exception as e:
-            logger.error(f"Error loading fallback JSON data: {e}")
+    # DISABLE JSON FALLBACKS AND MONGODB "ZODIAC_PERSONALITY" LOOKUP
+    # As per user request, we must rely ONLY on the retrieved chunks from "astrobot_original" (Book Data).
+    # Therefore, we do NOT load any pre-canned data here.
     
-    # โหลดข้อมูลสีมงคล (ยังใช้ JSON)
-    try:
-        lucky_color_path = os.path.join(os.path.dirname(__file__), "..", "data", "luckyColorData.json")
-        with open(lucky_color_path, 'r', encoding='utf-8') as f:
-            lucky_color_data = json.load(f)
-        
-        # โหลดข้อมูลโชคลาภ (ยังใช้ JSON)
-        omen_path = os.path.join(os.path.dirname(__file__), "..", "data", "omenData.json")
-        with open(omen_path, 'r', encoding='utf-8') as f:
-            omen_data = json.load(f)
-            
-    except Exception as e:
-        logger.error(f"Error loading color/omen data: {e}")
-        lucky_color_data = {}
-        omen_data = {}
+    # zodiac_data = get_zodiac_data_from_mongodb(zodiac_sign) ... (Disabled)
+    # chart_info['detailed_reading'] = ... (Disabled)
+    # lucky_color_data = ... (Disabled)
+    # omen_data = ... (Disabled)
     
-    # ข้อมูลสีมงคล (ใช้ราศีเป็นหลัก)
+    # Initialize empty structures to prevent errors if downstream code expects keys
+    chart_info['detailed_reading'] = {} 
     chart_info['lucky_colors'] = []
     chart_info['bad_colors'] = []
-    
-    # หาสีมงคลจากราศี (ใช้การประมาณการ)
-    color_mapping = {
-        'เมษ': 'อังคาร', 'พฤษภ': 'ศุกร์', 'เมถุน': 'พุธ', 'กรกฎ': 'จันทร์',
-        'สิงห์': 'อาทิตย์', 'กันย์': 'พุธ', 'ตุล': 'ศุกร์', 'พิจิก': 'อังคาร',
-        'ธนู': 'พฤหัสบดี', 'มังกร': 'เสาร์', 'กุมภ์': 'เสาร์', 'มีน': 'จันทร์'
-    }
-    
-    ruling_planet = color_mapping.get(zodiac_sign, 'อาทิตย์')
-    if ruling_planet in lucky_color_data:
-        chart_info['lucky_colors'] = lucky_color_data[ruling_planet].get('luckyColors', [])
-        chart_info['bad_colors'] = lucky_color_data[ruling_planet].get('badColors', [])
-    
-    # ข้อมูลโชคลาภ (ใช้ปีเกิด)
-    try:
-        birth_year = int(birth_info['date'].split('/')[2])
-        thai_year = birth_year + 543
-        
-        # คำนวณปีนักษัตร
-        animal_years = ['ชวด', 'ฉลู', 'ขาล', 'เถาะ', 'มะโรง', 'มะเส็ง', 
-                       'มะเมีย', 'มะแม', 'วอก', 'ระกา', 'จอ', 'กุน']
-        animal_index = (thai_year - 4) % 12
-        animal_year = animal_years[animal_index]
-        
-        # หาข้อมูลโชคลาภจากราศีและปีนักษัตร
-        ruling_planet_omens = omen_data.get(ruling_planet, {})
-        if animal_year in ruling_planet_omens:
-            chart_info['omen_info'] = ruling_planet_omens[animal_year]
-            
-    except Exception as e:
-        logger.error(f"Error calculating omen info: {e}")
+    chart_info['omen_info'] = {}
+
+    logger.info(f"✅ Created birth chart for {zodiac_sign} (Pure RAG Mode - No external data injected)")
     
     return chart_info
 
