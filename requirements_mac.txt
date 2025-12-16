@@ -164,4 +164,4 @@ yarl==1.18.3
 zstandard==0.23.0
 typhoon-ocr>=0.4.0
 easyocr==1.7.0  # Fallback if Typhoon OCR is not available
-pythainlp>=5.0.0
+pythainlp>=5.0.0flatlib==0.2.3

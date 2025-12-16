@@ -52,7 +52,6 @@ def main():
     # Limit for testing if needed, but user wants full evaluation probably.
     # The generation might take time and cost money.
     # I will process all items.
-    data = data[:5] # TEMPORARY LIMIT FOR SAMPLE VERIFICATION
     
     for i, item in enumerate(data):
         print(f"Processing {i+1}/{len(data)}...")
@@ -218,17 +217,46 @@ def main():
         print("\nEvaluation Results:")
         print(results)
         
-        # Save results to CSV (detailed)
+        # Save results to CSV (detailed) - KEEPING CSV AS BACKUP
         df = results.to_pandas()
         csv_filename = "ragas_evaluation_results.csv"
         df.to_csv(csv_filename, index=False)
         print(f"Detailed results saved to {csv_filename}")
         
-        # Save summary to JSON
+        # Save summary AND details to JSON as requested
+        summary_scores = dict(results)
+        
+        # Prepare detailed results list
+        detailed_results = []
+        for index, row in df.iterrows():
+            # Join contexts list into a single string
+            contexts_list = row.get('contexts', [])
+            if isinstance(contexts_list, list):
+                # Join with double newline or bullet points for readability
+                context_str = "\n".join(contexts_list)  
+            else:
+                context_str = str(contexts_list)
+
+            item = {
+                "question": row.get('question'),
+                "ground_truth": row.get('ground_truth'),
+                "answer": row.get('answer'),
+                "context": context_str, # Renamed from contexts and joined
+                "answer_relevancy": row.get('answer_relevancy'),
+                "faithfulness": row.get('faithfulness'),
+                "context_precision": row.get('context_precision'),
+                "context_recall": row.get('context_recall')
+            }
+            detailed_results.append(item)
+
+        final_output = {
+            "summary": summary_scores,
+            "details": detailed_results
+        }
+
         with open("ragas_summary.json", "w", encoding="utf-8") as f:
-            # results object is dict-like
-            json.dump(dict(results), f, indent=2, ensure_ascii=False)
-        print("Summary saved to ragas_summary.json")
+            json.dump(final_output, f, indent=2, ensure_ascii=False)
+        print("Comprehensive summary saved to ragas_summary.json")
         
     except Exception as e:
         print(f"Error during Ragas evaluation: {e}")

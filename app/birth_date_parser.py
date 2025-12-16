@@ -650,6 +650,24 @@ class BirthDateParser:
                         logger.warning("Failed to calculate houses")
                 except Exception as e:
                     logger.error(f"Error calculating houses: {e}")
+
+            # 🆕 คำนวณตำแหน่งดาวเคราะห์ (Planets) - คำนวณเสมอแม้ไม่มีเวลาเกิด (ใช้เวลาเที่ยงถ้าไม่ระบุ แต่ในที่นี้ birth_datetime มีค่าเสมอ)
+            try:
+                planets_data = self.astronomical_calculator.calculate_planetary_positions(
+                    birth_datetime, latitude, longitude
+                )
+                if planets_data:
+                    chart_info['planets'] = planets_data['planets']
+                    logger.info(f"✅ Calculated planetary positions: {len(planets_data['planets'])} planets")
+                    
+                    # คำนวณมุมสัมพันธ์ (Aspects)
+                    aspects_data = self.astronomical_calculator.calculate_aspects(planets_data)
+                    if aspects_data:
+                        chart_info['aspects'] = aspects_data
+                        logger.info(f"✅ Calculated aspects: {len(aspects_data)} aspects")
+                    
+            except Exception as e:
+                logger.error(f"Error calculating planets/aspects: {e}")
             
             return chart_info
             

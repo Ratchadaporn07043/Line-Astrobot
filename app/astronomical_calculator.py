@@ -8,6 +8,17 @@ from dotenv import load_dotenv
 
 from .multimodel_rag import ORIGINAL_DB_NAME
 
+# Import flatlib for accurate planetary calculations
+try:
+    from flatlib.datetime import Datetime as FlatlibDatetime
+    from flatlib.geopos import GeoPos
+    from flatlib.chart import Chart
+    from flatlib import aspects, const
+    FLATLIB_AVAILABLE = True
+except ImportError:
+    FLATLIB_AVAILABLE = False
+    logging.warning("flatlib not installed. Planetary calculations will be disabled.")
+
 logger = logging.getLogger(__name__)
 
 class AstronomicalCalculator:
@@ -312,6 +323,159 @@ class AstronomicalCalculator:
         except Exception as e:
             logger.error(f"เกิดข้อผิดพลาดในการคำนวณ house cusps: {e}")
             return None
+
+    def calculate_planetary_positions(self, birth_datetime: datetime, latitude: float, longitude: float) -> Dict:
+        """
+        คำนวณตำแหน่งดาวเคราะห์ (Planetary Positions)
+        
+        Args:
+            birth_datetime (datetime): เวลาเกิด
+            latitude (float): ละติจูด
+            longitude (float): ลองจิจูด
+            
+        Returns:
+            dict: ข้อมูลตำแหน่งดาวเคราะห์
+        """
+        if not FLATLIB_AVAILABLE:
+            return None
+            
+        try:
+            # แปลงเวลาเป็น UTC
+            if birth_datetime.tzinfo is None:
+                # ถ้าไม่มี timezone ให้สมมติว่าเป็น Local Time (BKK UTC+7)
+                # แต่ flatlib ต้องการ UTC หรือ string format ที่ชัดเจน
+                # วิธีที่ง่ายที่สุดคือแปลงเป็น string YYYY/MM/DD HH:MM และระบุ Offset
+                # สำหรับประเทศไทย UTC+7
+                pass
+            
+            # สร้าง Flatlib Datetime
+            # flatlib รับ date เป็น 'YYYY/MM/DD' และ time เป็น 'HH:MM' และ utcoffset เป็น signed float (e.g. +7)
+            date_str = birth_datetime.strftime('%Y/%m/%d')
+            time_str = birth_datetime.strftime('%H:%M')
+            
+            # สร้าง GeoPos
+            pos = GeoPos(latitude, longitude)
+            
+            # สร้าง Datetime object (UTC+7 สำหรับประเทศไทย)
+            # หมายเหตุ: ใน production ควรปรับตาม timezone จริงของผู้ใช้ แต่ตอนนี้ใช้ +7 ไปก่อน
+            date = FlatlibDatetime(date_str, time_str, '+07:00')
+            
+            # คำนวณ Chart
+            chart = Chart(date, pos, IDs=const.LIST_OBJECTS)
+            
+            planets = {}
+            thai_names = {
+                'Sun': 'อาทิตย์', 'Moon': 'จันทร์', 'Mercury': 'พุธ', 'Venus': 'ศุกร์',
+                'Mars': 'อังคาร', 'Jupiter': 'พฤหัสบดี', 'Saturn': 'เสาร์',
+                'Uranus': 'มฤตยู', 'Neptune': 'เนปจูน', 'Pluto': 'พลูโต',
+                'Chiron': 'ไครอน', 'North Node': 'ราหู', 'South Node': 'เกตุ'
+            }
+            
+            thai_zodiacs = {
+                'Aries': 'เมษ', 'Taurus': 'พฤษภ', 'Gemini': 'เมถุน', 'Cancer': 'กรกฎ',
+                'Leo': 'สิงห์', 'Virgo': 'กันย์', 'Libra': 'ตุล', 'Scorpio': 'พิจิก',
+                'Sagittarius': 'ธนู', 'Capricorn': 'มังกร', 'Aquarius': 'กุมภ์', 'Pisces': 'มีน'
+            }
+
+            for obj in const.LIST_OBJECTS:
+                planet = chart.get(obj)
+                name = getattr(planet, 'id', str(obj)) # ป้องกัน attribute error
+                sign = getattr(planet, 'sign', '')
+                lon = getattr(planet, 'lon', 0.0) # Absolute longitude
+                signlon = getattr(planet, 'signlon', 0.0) # Degree in sign
+                
+                # หา House (ต้องคำนวณ house แยก หรือดูจาก chart houses ถ้า flatlib map ให้)
+                # Flatlib's chart.get(obj) does not strictly return house. 
+                # We can check which house it falls into based on chart.houses
+                house_num = -1
+                for h_obj in const.LIST_HOUSES:
+                    house = chart.get(h_obj)
+                    if house.hasObject(planet):
+                        house_num = house.id.replace('House', '')
+                        break
+                
+                planets[name] = {
+                    'name_en': name,
+                    'name_th': thai_names.get(name, name),
+                    'sign_en': sign,
+                    'sign_th': thai_zodiacs.get(sign, sign),
+                    'degree': round(signlon, 2),
+                    'absolute_degree': round(lon, 2),
+                    'house': house_num,
+                    'retrograde': planet.isRetrograde()  # ตรวจสอบการเดินถอยหลัง
+                }
+                
+            return {
+                'planets': planets,
+                'chart_object': chart  # เก็บ object ไว้คำนวณ aspect ต่อ
+            }
+            
+        except Exception as e:
+            logger.error(f"เกิดข้อผิดพลาดในการคำนวณตำแหน่งดาวเคราะห์: {e}")
+            return None
+
+    def calculate_aspects(self, chart_data: Dict) -> list:
+        """
+        คำนวณมุมสัมพันธ์ (Aspects)
+        
+        Args:
+            chart_data (dict): ข้อมูล Chart ที่ได้จาก calculate_planetary_positions
+            
+        Returns:
+            list: รายการมุมสัมพันธ์
+        """
+        if not FLATLIB_AVAILABLE or not chart_data or 'chart_object' not in chart_data:
+            return []
+            
+        try:
+            chart = chart_data['chart_object']
+            aspect_list = []
+            
+            # มุมสัมพันธ์หลัก
+            major_aspects = [const.CONJUNCTION, const.SEXTILE, const.SQUARE, const.TRINE, const.OPPOSITION]
+            thai_aspects = {
+                const.CONJUNCTION: 'กุม',
+                const.SEXTILE: 'โยค', 
+                const.SQUARE: 'ฉาก',
+                const.TRINE: 'ตรีโกณ',
+                const.OPPOSITION: 'เล็ง'
+            }
+            
+            thai_names = {
+                'Sun': 'อาทิตย์', 'Moon': 'จันทร์', 'Mercury': 'พุธ', 'Venus': 'ศุกร์',
+                'Mars': 'อังคาร', 'Jupiter': 'พฤหัสบดี', 'Saturn': 'เสาร์',
+                'Uranus': 'มฤตยู', 'Neptune': 'เนปจูน', 'Pluto': 'พลูโต',
+                'North Node': 'ราหู', 'South Node': 'เกตุ'
+            }
+            
+            # วนลูปหา aspect ของดาวเคราะห์แต่ละคู่
+            objects = [obj for obj in const.LIST_OBJECTS if obj in ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto']]
+            
+            for i, p1_name in enumerate(objects):
+                for p2_name in objects[i+1:]:
+                    p1 = chart.get(p1_name)
+                    p2 = chart.get(p2_name)
+                    
+                    # คำนวณ aspect exactness
+                    # ใช้ aspects.getAspect แทน chart.getAspect
+                    aspect = aspects.getAspect(p1, p2, major_aspects)
+                    
+                    if aspect.exists():
+                        aspect_list.append({
+                            'p1': p1_name,
+                            'p1_th': thai_names.get(p1_name, p1_name),
+                            'p2': p2_name,
+                            'p2_th': thai_names.get(p2_name, p2_name),
+                            'type': aspect.type,
+                            'type_th': thai_aspects.get(aspect.type, aspect.type),
+                            'orb': round(aspect.orb, 2)
+                        })
+            
+            return aspect_list
+            
+        except Exception as e:
+            logger.error(f"เกิดข้อผิดพลาดในการคำนวณมุมสัมพันธ์: {e}")
+            return []
 
     def get_house_interpretation(self, house_number: int, house_data: Dict) -> str:
         """
