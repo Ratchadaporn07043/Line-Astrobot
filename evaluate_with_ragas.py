@@ -52,7 +52,7 @@ def main():
     # Limit for testing if needed, but user wants full evaluation probably.
     # The generation might take time and cost money.
     # I will process all items.
-    data = data[:10] # TEMPORARY LIMIT FOR SAMPLE VERIFICATION
+    data = data[:5] # TEMPORARY LIMIT FOR SAMPLE VERIFICATION
     
     for i, item in enumerate(data):
         print(f"Processing {i+1}/{len(data)}...")
@@ -76,10 +76,11 @@ def main():
             ragas_data["answer"].append(system_answer)
             
             # Truncate contexts to top 3 to avoid "context_length_exceeded"
-            # AND append chart_info_text so Ragas knows the zodiac source
+            # Truncate contexts to top 3 to avoid "context_length_exceeded"
+            # AND PREPEND chart_info_text so Ragas sees it first as the "Subject Identification"
             combined_contexts = retrieved_contexts[:3]
             if chart_info_text:
-                combined_contexts.append(chart_info_text)
+                combined_contexts.insert(0, chart_info_text)
                 
             ragas_data["contexts"].append(combined_contexts) # List[str]
             ragas_data["ground_truth"].append(ground_truth) # str
@@ -117,37 +118,32 @@ def main():
     ]
     
     # REWRITE IN THAI BUT STRICTLY DEFINE JSON OUTPUT
-    faithfulness.nli_statements_message.instruction = "คำสั่ง: ตรวจสอบว่าข้อความ (statement) ได้รับการสนับสนุนจากบริบท (context) หรือไม่ \nให้ตอบกลับเป็นรูปแบบ JSON เท่านั้น โดยมีรายการของ object ที่มีคีย์ \"statement\", \"verdict\" (1 หรือ 0), และ \"reason\"\n\nกฎการตัดสิน (ฉบับผ่อนปรน):\n1. หากบริบทระบุ **ราศี** (เช่น เมษ, พฤษภ) และข้อความเป็น **ลักษณะนิสัย/คำทำนายทั่วไป** ที่ถูกต้องตามหลักโหราศาสตร์สากล ให้ถือว่า **จริง (1)** แม้ไม่มีในบริบท\n2. ข้อมูลที่เป็น **ความรู้ทั่วไป** (Common Knowledge) หรือข้อเท็จจริงที่ชัดเจน ให้ถือว่า **จริง (1)**\n3. ข้อมูลที่มีแท็ก `[System]` ต้องถือเป็นความจริงสูงสุด (Absolute Truth)\n4. ให้ Verdict เป็น 0 เฉพาะกรณีที่ข้อความ **ขัดแย้ง** กับบริบทอย่างชัดเจน หรือเป็นข้อมูลที่ผิดพลาดเท่านั้น"
+    faithfulness.nli_statements_message.instruction = "คำสั่ง: ตรวจสอบว่าข้อความ (statement) ได้รับการสนับสนุนจากบริบท (context) หรือไม่ \nให้ตอบกลับเป็นรูปแบบ JSON เท่านั้น โดยมีรายการของ object ที่มีคีย์ \"statement\", \"verdict\" (1 หรือ 0), และ \"reason\"\n\nกฎการตัดสิน:\n1. หากบริบทระบุ **ราศี** (เช่น เมษ, พฤษภ) และข้อความเป็น **ลักษณะนิสัย/คำทำนายทั่วไป** ที่ถูกต้องของราศีนั้น ให้ถือว่า **จริง (1)**\n2. ข้อมูลที่มีแท็ก `[System]` ต้องถือเป็นความจริงสูงสุด (Absolute Truth)\n3. กรณีอื่น ให้ตัดสินจากบริบทเท่านั้น"
     faithfulness.nli_statements_message.examples = [
         {
             "context": "แมวเป็นสัตว์เลี้ยงลูกด้วยนมที่ชอบนอน",
-            "statements": '["แมวชอบนอน", "แมวมี 4 ขา"]', 
+            "statements": '["แมวชอบนอน", "แมวบินได้"]', 
             "analysis": [
                 {
                     "statement": "แมวชอบนอน",
                     "verdict": 1,
-                    "reason": "ตรงกับบริบท"
+                    "reason": "บริบทระบุชัดเจน"
                 },
                 {
-                    "statement": "แมวมี 4 ขา",
-                    "verdict": 1,
-                    "reason": "เป็นความรู้ทั่วไปที่ถูกต้อง (General Knowledge) แม้ไม่มีในบริบท"
+                    "statement": "แมวบินได้",
+                    "verdict": 0,
+                    "reason": "บริบทไม่ได้ระบุ"
                 }
             ]
         },
         {
             "context": "ราศี: พฤษภ (ธาตุดิน)",
-            "statements": '["ชาวราศีพฤษภมีความอดทน", "ราศีพฤษภเป็นธาตุลม"]',
+            "statements": '["ชาวราศีพฤษภมีความอดทนและชอบความมั่นคง"]',
             "analysis": [
                 {
-                    "statement": "ชาวราศีพฤษภมีความอดทน",
+                    "statement": "ชาวราศีพฤษภมีความอดทนและชอบความมั่นคง",
                     "verdict": 1,
-                    "reason": "เป็นลักษณะนิสัยทั่วไปของราศีพฤษภ (Astrological Knowledge)"
-                },
-                {
-                    "statement": "ราศีพฤษภเป็นธาตุลม",
-                    "verdict": 0,
-                    "reason": "ขัดแย้งกับบริบทที่ระบุว่าเป็นธาตุดิน"
+                    "reason": "อนุมานได้จากราศีพฤษภในบริบท"
                 }
             ]
         }
