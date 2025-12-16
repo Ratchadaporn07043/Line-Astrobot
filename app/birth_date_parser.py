@@ -402,18 +402,54 @@ class BirthDateParser:
         
         # ราศีและข้อมูล
         zodiac_data = {
-            'aries': {'name': 'เมษ', 'element': 'ไฟ', 'quality': 'Cardinal', 'keywords': ['เมษ', 'ราศีเมษ']},
-            'taurus': {'name': 'พฤษภ', 'element': 'ดิน', 'quality': 'Fixed', 'keywords': ['พฤษภ', 'ราศีพฤษภ']},
-            'gemini': {'name': 'เมถุน', 'element': 'ลม', 'quality': 'Mutable', 'keywords': ['เมถุน', 'ราศีเมถุน']},
-            'cancer': {'name': 'กรกฎ', 'element': 'น้ำ', 'quality': 'Cardinal', 'keywords': ['กรกฎ', 'ราศีกรกฎ']},
-            'leo': {'name': 'สิงห์', 'element': 'ไฟ', 'quality': 'Fixed', 'keywords': ['สิงห์', 'ราศีสิงห์']},
-            'virgo': {'name': 'กันย์', 'element': 'ดิน', 'quality': 'Mutable', 'keywords': ['กันย์', 'ราศีกันย์']},
-            'libra': {'name': 'ตุล', 'element': 'ลม', 'quality': 'Cardinal', 'keywords': ['ตุล', 'ราศีตุล']},
-            'scorpio': {'name': 'พิจิก', 'element': 'น้ำ', 'quality': 'Fixed', 'keywords': ['พิจิก', 'ราศีพิจิก']},
-            'sagittarius': {'name': 'ธนู', 'element': 'ไฟ', 'quality': 'Mutable', 'keywords': ['ธนู', 'ราศีธนู']},
-            'capricorn': {'name': 'มังกร', 'element': 'ดิน', 'quality': 'Cardinal', 'keywords': ['มังกร', 'ราศีมังกร']},
-            'aquarius': {'name': 'กุมภ์', 'element': 'ลม', 'quality': 'Fixed', 'keywords': ['กุมภ์', 'ราศีกุมภ์']},
-            'pisces': {'name': 'มีน', 'element': 'น้ำ', 'quality': 'Mutable', 'keywords': ['มีน', 'ราศีมีน']}
+            'aries': {
+                'name': 'เมษ', 'element': 'ไฟ', 'quality': 'Cardinal', 'keywords': ['เมษ', 'ราศีเมษ'],
+                'description': 'ผู้ที่เต็มไปด้วยพลังงาน ความกระตือรือล้น และความเป็นผู้นำ กล้าหาญและชอบการแข่งขัน'
+            },
+            'taurus': {
+                'name': 'พฤษภ', 'element': 'ดิน', 'quality': 'Fixed', 'keywords': ['พฤษภ', 'ราศีพฤษภ'],
+                'description': 'ผู้ที่มีความอดทน มั่นคง รักความสงบ และชื่นชอบในสุนทรียภาพและความงาม'
+            },
+            'gemini': {
+                'name': 'เมถุน', 'element': 'ลม', 'quality': 'Mutable', 'keywords': ['เมถุน', 'ราศีเมถุน'],
+                'description': 'ผู้ที่มีความสามารถในการสื่อสาร ปรับตัวเก่ง อยากรู้อยากเห็น และมีความคิดสร้างสรรค์'
+            },
+            'cancer': {
+                'name': 'กรกฎ', 'element': 'น้ำ', 'quality': 'Cardinal', 'keywords': ['กรกฎ', 'ราศีกรกฎ'],
+                'description': 'ผู้ที่มีความอ่อนโยน รักครอบครัว มีสัญชาตญาณในการปกป้องดูแล และมีความรู้สึกไว'
+            },
+            'leo': {
+                'name': 'สิงห์', 'element': 'ไฟ', 'quality': 'Fixed', 'keywords': ['สิงห์', 'ราศีสิงห์'],
+                'description': 'ผู้ที่มีความมั่นใจ เป็นผู้นำโดยธรรมชาติ ใจกว้าง และมีความคิดสร้างสรรค์'
+            },
+            'virgo': {
+                'name': 'กันย์', 'element': 'ดิน', 'quality': 'Mutable', 'keywords': ['กันย์', 'ราศีกันย์'],
+                'description': 'ผู้ที่ละเอียดรอบคอบ มีระเบียบวินัย ช่างสังเกต และใส่ใจในรายละเอียด'
+            },
+            'libra': {
+                'name': 'ตุล', 'element': 'ลม', 'quality': 'Cardinal', 'keywords': ['ตุล', 'ราศีตุล'],
+                'description': 'ผู้ที่รักความยุติธรรม มีเสน่ห์ เข้าสังคมเก่ง และแสวงหาความสมดุลในชีวิต'
+            },
+            'scorpio': {
+                'name': 'พิจิก', 'element': 'น้ำ', 'quality': 'Fixed', 'keywords': ['พิจิก', 'ราศีพิจิก'],
+                'description': 'ผู้ที่มีความลึกลับ มีเสน่ห์ดึงดูด มุ่งมั่นจริงจัง และมีความรู้สึกที่ลึกซึ้ง'
+            },
+            'sagittarius': {
+                'name': 'ธนู', 'element': 'ไฟ', 'quality': 'Mutable', 'keywords': ['ธนู', 'ราศีธนู'],
+                'description': 'ผู้ที่รักอิสระ มองโลกในแง่ดี ชอบการผจญภัย และแสวงหาความจริง'
+            },
+            'capricorn': {
+                'name': 'มังกร', 'element': 'ดิน', 'quality': 'Cardinal', 'keywords': ['มังกร', 'ราศีมังกร'],
+                'description': 'ผู้ที่มีความทะเยอทะยาน รับผิดชอบสูง มีวินัย และมุ่งมั่นสู่ความสำเร็จ'
+            },
+            'aquarius': {
+                'name': 'กุมภ์', 'element': 'ลม', 'quality': 'Fixed', 'keywords': ['กุมภ์', 'ราศีกุมภ์'],
+                'description': 'ผู้ที่มีความคิดเป็นตัวของตัวเอง รักอิสระ มีวิสัยทัศน์ และชอบช่วยเหลือสังคม'
+            },
+            'pisces': {
+                'name': 'มีน', 'element': 'น้ำ', 'quality': 'Mutable', 'keywords': ['มีน', 'ราศีมีน'],
+                'description': 'ผู้ที่มีจินตนาการสูง เห็นอกเห็นใจผู้อื่น มีสัญชาตญาณดี และมีความยืดหยุ่น'
+            }
         }
         
         # ค้นหาชื่อราศีในข้อความ (ใช้ regex เพื่อตรวจสอบคำเต็ม)
@@ -428,7 +464,8 @@ class BirthDateParser:
                         'sign': sign_info['name'],
                         'element': sign_info['element'],
                         'quality': sign_info['quality'],
-                        'english_name': sign_key.title()
+                        'english_name': sign_key.title(),
+                        'description': sign_info['description']
                     }
         
         return None
@@ -446,18 +483,54 @@ class BirthDateParser:
         """
         # ราศีและข้อมูล
         zodiac_data = {
-            'aries': {'name': 'เมษ', 'element': 'ไฟ', 'quality': 'Cardinal', 'dates': [(3, 21), (4, 19)]},
-            'taurus': {'name': 'พฤษภ', 'element': 'ดิน', 'quality': 'Fixed', 'dates': [(4, 20), (5, 20)]},
-            'gemini': {'name': 'เมถุน', 'element': 'ลม', 'quality': 'Mutable', 'dates': [(5, 21), (6, 20)]},
-            'cancer': {'name': 'กรกฎ', 'element': 'น้ำ', 'quality': 'Cardinal', 'dates': [(6, 21), (7, 22)]},
-            'leo': {'name': 'สิงห์', 'element': 'ไฟ', 'quality': 'Fixed', 'dates': [(7, 23), (8, 22)]},
-            'virgo': {'name': 'กันย์', 'element': 'ดิน', 'quality': 'Mutable', 'dates': [(8, 23), (9, 22)]},
-            'libra': {'name': 'ตุล', 'element': 'ลม', 'quality': 'Cardinal', 'dates': [(9, 23), (10, 22)]},
-            'scorpio': {'name': 'พิจิก', 'element': 'น้ำ', 'quality': 'Fixed', 'dates': [(10, 23), (11, 21)]},
-            'sagittarius': {'name': 'ธนู', 'element': 'ไฟ', 'quality': 'Mutable', 'dates': [(11, 22), (12, 21)]},
-            'capricorn': {'name': 'มังกร', 'element': 'ดิน', 'quality': 'Cardinal', 'dates': [(12, 22), (1, 19)]},
-            'aquarius': {'name': 'กุมภ์', 'element': 'ลม', 'quality': 'Fixed', 'dates': [(1, 20), (2, 18)]},
-            'pisces': {'name': 'มีน', 'element': 'น้ำ', 'quality': 'Mutable', 'dates': [(2, 19), (3, 20)]}
+            'aries': {
+                'name': 'เมษ', 'element': 'ไฟ', 'quality': 'Cardinal', 'dates': [(3, 21), (4, 19)],
+                'description': 'ผู้ที่เต็มไปด้วยพลังงาน ความกระตือรือล้น และความเป็นผู้นำ กล้าหาญและชอบการแข่งขัน'
+            },
+            'taurus': {
+                'name': 'พฤษภ', 'element': 'ดิน', 'quality': 'Fixed', 'dates': [(4, 20), (5, 20)],
+                'description': 'ผู้ที่มีความอดทน มั่นคง รักความสงบ และชื่นชอบในสุนทรียภาพและความงาม'
+            },
+            'gemini': {
+                'name': 'เมถุน', 'element': 'ลม', 'quality': 'Mutable', 'dates': [(5, 21), (6, 20)],
+                'description': 'ผู้ที่มีความสามารถในการสื่อสาร ปรับตัวเก่ง อยากรู้อยากเห็น และมีความคิดสร้างสรรค์'
+            },
+            'cancer': {
+                'name': 'กรกฎ', 'element': 'น้ำ', 'quality': 'Cardinal', 'dates': [(6, 21), (7, 22)],
+                'description': 'ผู้ที่มีความอ่อนโยน รักครอบครัว มีสัญชาตญาณในการปกป้องดูแล และมีความรู้สึกไว'
+            },
+            'leo': {
+                'name': 'สิงห์', 'element': 'ไฟ', 'quality': 'Fixed', 'dates': [(7, 23), (8, 22)],
+                'description': 'ผู้ที่มีความมั่นใจ เป็นผู้นำโดยธรรมชาติ ใจกว้าง และมีความคิดสร้างสรรค์'
+            },
+            'virgo': {
+                'name': 'กันย์', 'element': 'ดิน', 'quality': 'Mutable', 'dates': [(8, 23), (9, 22)],
+                'description': 'ผู้ที่ละเอียดรอบคอบ มีระเบียบวินัย ช่างสังเกต และใส่ใจในรายละเอียด'
+            },
+            'libra': {
+                'name': 'ตุล', 'element': 'ลม', 'quality': 'Cardinal', 'dates': [(9, 23), (10, 22)],
+                'description': 'ผู้ที่รักความยุติธรรม มีเสน่ห์ เข้าสังคมเก่ง และแสวงหาความสมดุลในชีวิต'
+            },
+            'scorpio': {
+                'name': 'พิจิก', 'element': 'น้ำ', 'quality': 'Fixed', 'dates': [(10, 23), (11, 21)],
+                'description': 'ผู้ที่มีความลึกลับ มีเสน่ห์ดึงดูด มุ่งมั่นจริงจัง และมีความรู้สึกที่ลึกซึ้ง'
+            },
+            'sagittarius': {
+                'name': 'ธนู', 'element': 'ไฟ', 'quality': 'Mutable', 'dates': [(11, 22), (12, 21)],
+                'description': 'ผู้ที่รักอิสระ มองโลกในแง่ดี ชอบการผจญภัย และแสวงหาความจริง'
+            },
+            'capricorn': {
+                'name': 'มังกร', 'element': 'ดิน', 'quality': 'Cardinal', 'dates': [(12, 22), (1, 19)],
+                'description': 'ผู้ที่มีความทะเยอทะยาน รับผิดชอบสูง มีวินัย และมุ่งมั่นสู่ความสำเร็จ'
+            },
+            'aquarius': {
+                'name': 'กุมภ์', 'element': 'ลม', 'quality': 'Fixed', 'dates': [(1, 20), (2, 18)],
+                'description': 'ผู้ที่มีความคิดเป็นตัวของตัวเอง รักอิสระ มีวิสัยทัศน์ และชอบช่วยเหลือสังคม'
+            },
+            'pisces': {
+                'name': 'มีน', 'element': 'น้ำ', 'quality': 'Mutable', 'dates': [(2, 19), (3, 20)],
+                'description': 'ผู้ที่มีจินตนาการสูง เห็นอกเห็นใจผู้อื่น มีสัญชาตญาณดี และมีความยืดหยุ่น'
+            }
         }
         
         # ค้นหาราศี
@@ -473,7 +546,8 @@ class BirthDateParser:
                         'sign': sign_info['name'],
                         'element': sign_info['element'],
                         'quality': sign_info['quality'],
-                        'english_name': sign_key.title()
+                        'english_name': sign_key.title(),
+                        'description': sign_info['description']
                     }
             else:
                 if (month == start_month and day >= start_day) or (month == end_month and day <= end_day):
@@ -482,7 +556,8 @@ class BirthDateParser:
                         'sign': sign_info['name'],
                         'element': sign_info['element'],
                         'quality': sign_info['quality'],
-                        'english_name': sign_key.title()
+                        'english_name': sign_key.title(),
+                        'description': sign_info['description']
                     }
         
         logger.warning(f"No zodiac match found for day={day}, month={month}")
@@ -539,6 +614,7 @@ class BirthDateParser:
                 'zodiac_element': zodiac_info['element'],
                 'zodiac_quality': zodiac_info['quality'],
                 'zodiac_english': zodiac_info['english_name'],
+                'zodiac_description': zodiac_info.get('description', ''),
                 'birth_datetime': birth_datetime,
                 'birth_location': {
                     'latitude': latitude,

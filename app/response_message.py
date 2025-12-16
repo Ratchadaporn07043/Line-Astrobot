@@ -349,7 +349,8 @@ def generate_reply_message(event):
             'zodiac_sign': detected_zodiac['sign'],
             'zodiac_element': detected_zodiac['element'],
             'zodiac_quality': detected_zodiac['quality'],
-            'zodiac_english': detected_zodiac['english_name']
+            'zodiac_english': detected_zodiac['english_name'],
+            'zodiac_description': detected_zodiac.get('description', '')
         }
 
     # ตรวจสอบจำนวนคำถามต่อเนื่อง (ไม่จำกัดจำนวนครั้ง)
