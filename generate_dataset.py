@@ -17,7 +17,7 @@ DB_NAME = "astrobot_original"  # Correct DB for content chunks
 COLLECTIONS = ["original_text_chunks", "original_image_chunks", "original_table_chunks"]
 
 KEYWORDS = ["วันเดือนปีเกิด", "เวลาเกิด", "การงาน", "การเงิน", "ความรัก", "สีมงคล"]
-TARGET_COUNT = 120
+TARGET_COUNT = 10
 
 def get_mongo_client():
     try:
