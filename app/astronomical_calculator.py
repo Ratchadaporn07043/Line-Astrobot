@@ -343,25 +343,46 @@ class AstronomicalCalculator:
             # แปลงเวลาเป็น UTC
             if birth_datetime.tzinfo is None:
                 # ถ้าไม่มี timezone ให้สมมติว่าเป็น Local Time (BKK UTC+7)
-                # แต่ flatlib ต้องการ UTC หรือ string format ที่ชัดเจน
-                # วิธีที่ง่ายที่สุดคือแปลงเป็น string YYYY/MM/DD HH:MM และระบุ Offset
-                # สำหรับประเทศไทย UTC+7
                 pass
+            
+            # Input Validation
+            try:
+                latitude = float(latitude)
+                longitude = float(longitude)
+            except ValueError:
+                logger.error(f"Invalid lat/lon values: {latitude}, {longitude}")
+                return None
+                
+            # Clamp latitude to prevent math domain errors (though flatlib handles it usually)
+            latitude = max(-90.0, min(90.0, latitude))
             
             # สร้าง Flatlib Datetime
             # flatlib รับ date เป็น 'YYYY/MM/DD' และ time เป็น 'HH:MM' และ utcoffset เป็น signed float (e.g. +7)
             date_str = birth_datetime.strftime('%Y/%m/%d')
             time_str = birth_datetime.strftime('%H:%M')
             
-            # สร้าง GeoPos
-            pos = GeoPos(latitude, longitude)
-            
-            # สร้าง Datetime object (UTC+7 สำหรับประเทศไทย)
-            # หมายเหตุ: ใน production ควรปรับตาม timezone จริงของผู้ใช้ แต่ตอนนี้ใช้ +7 ไปก่อน
-            date = FlatlibDatetime(date_str, time_str, '+07:00')
-            
-            # คำนวณ Chart
-            chart = Chart(date, pos, IDs=const.LIST_OBJECTS)
+            try:
+                # ตรวจสอบค่า latitude/longitude
+                if not (-90 <= latitude <= 90):
+                    logger.warning(f"Latitude out of range: {latitude}. Clamping to valid range.")
+                    latitude = max(-90.0, min(90.0, latitude))
+                
+                if not (-180 <= longitude <= 180):
+                    logger.warning(f"Longitude out of range: {longitude}. Normalizing.")
+                    longitude = ((longitude + 180) % 360) - 180
+
+                # สร้าง GeoPos
+                # Flatlib ต้องการ latitude/longitude เป็น float
+                pos = GeoPos(float(latitude), float(longitude))
+                
+                # สร้าง Datetime object (UTC+7 สำหรับประเทศไทย)
+                date = FlatlibDatetime(date_str, time_str, '+07:00')
+                
+                # คำนวณ Chart
+                chart = Chart(date, pos, IDs=const.LIST_OBJECTS)
+            except Exception as e:
+                logger.error(f"Flatlib Chart Error for {date_str} {time_str} at {latitude},{longitude}: {e}")
+                return None
             
             planets = {}
             thai_names = {

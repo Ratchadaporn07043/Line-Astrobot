@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta, time as dt_time
 from typing import Tuple
 from pymongo import MongoClient
+from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from .birth_date_parser import generate_astrology_reading, generate_detailed_astrology_reading, extract_birth_info_from_message
@@ -13,7 +14,67 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 # โหลด environment variables
+
+# โหลด environment variables
 load_dotenv()
+
+# ============================
+# 🆕 Constants for Entity Filtering
+# ============================
+ASTRO_SYSTEM_ENTITIES = {
+    # ดาวเคราะห์ (Planets)
+    "sun": ["อาทิตย์", "sun", "apollon"],
+    "moon": ["จันทร์", "moon", "luna"],
+    "mercury": ["พุธ", "mercury", "hermes"],
+    "venus": ["ศุกร์", "venus", "aphrodite"],
+    "mars": ["อังคาร", "mars", "ares"],
+    "jupiter": ["พฤหัส", "พฤหัสบดี", "jupiter", "zeus"],
+    "saturn": ["เสาร์", "saturn", "kronos"],
+    "uranus": ["มฤตยู", "ยูเรนัส", "uranus"],
+    "neptune": ["เนปจูน", "neptune", "poseidon"],
+    "pluto": ["พลูโต", "pluto", "hades"],
+    "rahu": ["ราหู", "node", "north node"],
+    "ketu": ["เกตุ", "south node"],
+    
+    # ราศี (Zodiacs)
+    "aries": ["เมษ", "aries"],
+    "taurus": ["พฤษภ", "taurus"],
+    "gemini": ["มิถุน", "เมถุน", "gemini"],
+    "cancer": ["กรกฎ", "cancer"],
+    "leo": ["สิงห์", "leo"],
+    "virgo": ["กันย์", "virgo"],
+    "libra": ["ตุลย์", "libra"],
+    "scorpio": ["พิจิก", "scorpio"],
+    "sagittarius": ["ธนู", "sagittarius"],
+    "capricorn": ["มังกร", "capricorn"],
+    "aquarius": ["กุมภ์", "aquarius"],
+    "pisces": ["มีน", "pisces"]
+}
+
+NOISE_KEYWORDS = ["pottery", "ceramic", "clay", "vessel", "sherd", "kiln", "excavation"]  # คำที่มักเจอในเอกสารขยะ
+
+# Helper function to extract entities
+def extract_astro_entities(text: str) -> dict:
+    """
+    แยกแยะชื่อดาวและราศีจากข้อความ
+    Returns: {'planets': [list of keys], 'zodiacs': [list of keys]}
+    """
+    text_lower = text.lower()
+    found = {'planets': [], 'zodiacs': []}
+    
+    for key, keywords in ASTRO_SYSTEM_ENTITIES.items():
+        for kw in keywords:
+            if kw in text_lower:
+                # แยกประเภทว่าเป็นดาวหรือราศี (ง่ายๆ ด้วยการเช็ค key)
+                if key in ["aries", "taurus", "gemini", "cancer", "leo", "virgo", "libra", "scorpio", "sagittarius", "capricorn", "aquarius", "pisces"]:
+                    if key not in found['zodiacs']:
+                        found['zodiacs'].append(key)
+                else:
+                    if key not in found['planets']:
+                        found['planets'].append(key)
+                break
+    return found
+
 
 # ตั้งค่า Logger
 logger = logging.getLogger(__name__)
@@ -1617,6 +1678,43 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
                                                     print(f"   ✅ เอกสาร fallback ที่ {i+1} (Similarity: {sim:.4f})")
                                     continue
                                 
+                                # 🆕 Apply Re-ranking / Boosting logic
+                                # Extract entities from query for boosting
+                                query_entities = extract_astro_entities(question)
+                                query_planets = query_entities.get('planets', [])
+                                
+                                boosted_similarities = []
+                                for score, doc in similarities:
+                                    boost_score = score
+                                    text = doc.get('text', '')
+                                    
+                                    # 1. Zodiac Boost (+0.2)
+                                    if astrology_chart and astrology_chart.get('zodiac_sign'):
+                                        zodiac_patterns = [
+                                            f"ราศี{astrology_chart['zodiac_sign']}", 
+                                            f"คนราศี{astrology_chart['zodiac_sign']}",
+                                            f"ชาวราศี{astrology_chart['zodiac_sign']}"
+                                        ]
+                                        if any(p in text for p in zodiac_patterns):
+                                            boost_score += 0.2
+                                            
+                                    # 2. Day of Week Boost (+0.15)
+                                    if astrology_chart and astrology_chart.get('day_of_week'):
+                                        if astrology_chart['day_of_week'] in text:
+                                            boost_score += 0.15
+                                            
+                                    # 3. Planet Boost (+0.1)
+                                    for planet in query_planets:
+                                        # Check keywords for planet
+                                        keywords = ASTRO_SYSTEM_ENTITIES.get(planet, [])
+                                        if any(kw in text.lower() for kw in keywords):
+                                            boost_score += 0.1
+                                            break # Boost only once per planet
+                                            
+                                    boosted_similarities.append((boost_score, doc))
+                                
+                                similarities = boosted_similarities
+
                                 # เรียงตาม similarity score
                                 similarities.sort(key=lambda x: x[0], reverse=True)
                                 
@@ -1676,20 +1774,45 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
                                     
                                     print(f"   🔍 หลังกรองตามราศี{target_zodiac_sign}: พบ {len(filtered_docs)} เอกสาร (จาก {len(top_docs_for_zodiac_filter)} เอกสารที่มี similarity > {similarity_threshold})")
                                     
-                                    # 🆕 ถ้ามีเอกสารที่กรองแล้ว ให้ใช้ top 10 จากเอกสารที่กรองแล้ว (เพิ่มจาก 5 เป็น 10 เพื่อให้ครอบคลุมมากขึ้น)
+                                    # 🆕 Strict Filtering: ใช้เอกสารที่ผ่านเกณฑ์เท่านั้น ไม่พยายามดึงมาให้ครบจำนวน
                                     if filtered_docs:
                                         # เรียงตาม similarity จากสูงไปต่ำ
                                         filtered_docs.sort(key=lambda x: x[0], reverse=True)
-                                        top_docs = filtered_docs[:10]  # เพิ่มจาก 5 เป็น 10
-                                        print(f"   ✅ ใช้ top 10 เอกสารจากเอกสารที่กรองแล้ว (similarity > {similarity_threshold} และเกี่ยวข้องกับราศี{target_zodiac_sign})")
+                                        # ตัดเอกสารที่มีคะแนนต่ำเกินไปออก (Strict Cutoff)
+                                        # เช่น ถ้าคะแนนต่ำกว่า 0.45 ให้ตัดทิ้งเลย แม้จะไม่ครบ 7 เอกสารก็ตาม
+                                        strict_threshold_for_cutoff = 0.45
+                                        top_docs = [doc for doc in filtered_docs if doc[0] >= strict_threshold_for_cutoff]
+                                        
+                                        # ถ้า after cutoff ยังเหลือเอกสาร ให้ใช้ top 7
+                                        if top_docs:
+                                            top_docs = top_docs[:7]
+                                            print(f"   ✅ [Strict Filter] ใช้ {len(top_docs)} เอกสารที่ผ่านเกณฑ์ (Sim >= {strict_threshold_for_cutoff}) และเกี่ยวข้องกับราศี{target_zodiac_sign}")
+                                        else:
+                                            # ถ้าตัดแล้วไม่เหลือเลย ให้ใช้ตัวที่ดีที่สุดสัก 2-3 ตัวแทน (Fallback แบบ Minimal)
+                                            # เพื่อกันไม่ให้ตอบว่า "ไม่รู้" เลยถ้ายังมีข้อมูลที่พอถูไถได้
+                                            top_docs = filtered_docs[:3]
+                                            print(f"   ⚠️ [Strict Filter] เอกสารคะแนนต่ำกว่าเกณฑ์ ({strict_threshold_for_cutoff}) แต่ขอยกเว้นให้ใช้ 3 อันดับแรก")
                                     else:
                                         # 🆕 ถ้าไม่มีเอกสารที่กรองแล้ว ให้ลองค้นหาใหม่ด้วย query ที่เฉพาะเจาะจงมากขึ้น
                                         print(f"   ⚠️ ไม่พบเอกสารที่เกี่ยวข้องกับราศี{target_zodiac_sign} จาก {len(top_docs_for_zodiac_filter)} เอกสาร")
-                                        print(f"   🔄 ลองใช้ top 10 เอกสารที่มี similarity สูงสุด (แม้จะไม่เกี่ยวข้องกับราศี{target_zodiac_sign} โดยตรง)")
-                                        top_docs = high_similarity_docs[:10]  # เพิ่มจาก 5 เป็น 10
+                                        # Strict Fallback: ถ้าไม่เจอราศีที่ตรงเป๊ะ ให้ใช้ Top Docs ปกติ แต่ต้องคะแนนสูงจริง
+                                        strict_general_threshold = 0.50
+                                        top_docs = [doc for doc in high_similarity_docs if doc[0] >= strict_general_threshold]
+                                        if top_docs:
+                                            top_docs = top_docs[:5] # ลดจำนวนลงอีกถ้าไม่ใช่ราศีที่ตรง
+                                            print(f"   🔄 [Fallback] ใช้ {len(top_docs)} เอกสารทั่วไปที่มีความมั่นใจสูง (Sim >= {strict_general_threshold})")
+                                        else:
+                                             top_docs = high_similarity_docs[:3] # Minimal Fallback
+                                             print(f"   🔄 [Fallback] ใช้ 3 เอกสารที่ดีที่สุด (Best Effort)")
                                 else:
-                                    # ถ้าไม่มีการกรองตามราศี ให้ใช้ top 5 จากเอกสารที่มี similarity > 0.5
-                                    top_docs = high_similarity_docs[:5]
+                                    # ถ้าไม่มีการกรองตามราศี ให้ใช้ top 7 จากเอกสารที่มี similarity > 0.5
+                                    # Strict Filtering เช่นกัน
+                                    strict_general_threshold = 0.50
+                                    top_docs = [doc for doc in high_similarity_docs if doc[0] >= strict_general_threshold]
+                                    if top_docs:
+                                        top_docs = top_docs[:7]
+                                    else:
+                                        top_docs = high_similarity_docs[:3]
                                 
                                 # 🆕 ใช้ threshold เดียวกันสำหรับการแสดงผล
                                 threshold = similarity_threshold
@@ -2636,7 +2759,7 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
                 parser = BirthDateParser()
                 info = parser.extract_birth_info(question)
                 if info and info.get('date'):
-                    chart = parser.generate_birth_chart_info(info['date'], info.get('time'), info.get('latitude', 13.7563), info.get('longitude', 100.5018))
+                    chart = parser.generate_birth_chart_info(birth_date=info['date'], birth_time=info.get('time'), latitude=info.get('latitude', 13.7563), longitude=info.get('longitude', 100.5018))
                     if chart and chart.get('zodiac_sign'):
                         answer = f"วันเกิด: {info['date']}\nราศีของคุณคือ ราศี{chart['zodiac_sign']}"
                     else:
@@ -2739,4 +2862,927 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
 
     # print(f"=== ส่งคำตอบให้ผู้ใช้: {user_id} ===\n")
     return answer
-    return answer
+
+
+# ============================
+# ⚠️ ฟังก์ชัน Retrieval สำหรับการประเมิน RAGAS
+# ============================
+# ฟังก์ชันนี้แยกออกจาก ask_question_to_rag เพื่อไม่ให้กระทบกับระบบ Line chatbot
+# - ไม่มีการตรวจสอบ question limit
+# - ไม่มีการดึง user context
+# - ไม่มีการตรวจสอบ follow-up question
+# - ไม่มีการบันทึกข้อมูลลงฐานข้อมูล
+# - แต่ยังคงทำ retrieval และ generation เหมือนเดิม
+# ============================
+def ask_question_to_rag_for_evaluation(question: str, provided_chart_info: dict = None) -> str:
+    """
+    ฟังก์ชัน retrieval สำหรับการประเมิน RAGAS โดยเฉพาะ
+    
+    แตกต่างจาก ask_question_to_rag:
+    - ไม่มีการตรวจสอบ question limit
+    - ไม่มีการดึง user context
+    - ไม่มีการตรวจสอบ follow-up question
+    - ไม่มีการบันทึกข้อมูลลงฐานข้อมูล
+    - แต่ยังคงทำ retrieval และ generation เหมือนเดิม
+    
+    Args:
+        question (str): คำถามที่ต้องการค้นหา
+        provided_chart_info (dict, optional): ข้อมูลดวงชะตาที่เตรียมไว้แล้ว
+        
+    Returns:
+        str: คำตอบจากระบบ RAG
+    """
+    # ตรวจสอบว่ามีข้อมูลวันเกิดและเวลาเกิดในคำถามหรือไม่
+    birth_info_from_question = extract_birth_info_from_message(question)
+    astrology_chart = None
+    
+    # ถ้ามี chart_info ที่ส่งมา ให้ใช้เลย
+    if provided_chart_info:
+        astrology_chart = provided_chart_info
+        logger.info(f"[EVAL] ใช้ chart_info ที่ส่งมา: ราศี{astrology_chart.get('zodiac_sign', 'Unknown')}")
+    
+    # สร้างข้อมูลดวงชะตาเมื่อมีข้อมูลวันเกิดในคำถาม (ถ้ายังไม่มี chart_info อยู่แล้ว)
+    if not astrology_chart and birth_info_from_question and birth_info_from_question['date']:
+        logger.info(f"[EVAL] พบข้อมูลวันเกิดในคำถาม: {birth_info_from_question['date']}")
+        if birth_info_from_question['time']:
+            logger.info(f"[EVAL] พบเวลาเกิดในคำถาม: {birth_info_from_question['time']}")
+        
+        # สร้างข้อมูลดวงชะตารายละเอียด
+        astrology_chart = generate_detailed_astrology_reading(question)
+        if astrology_chart:
+            logger.info(f"[EVAL] สร้างดวงชะตาสำเร็จ: ราศี{astrology_chart['zodiac_sign']} ({astrology_chart['zodiac_element']})")
+    
+    # วิเคราะห์เจตนาของคำถาม
+    question_intent = analyze_question_intent(question)
+    
+    # ตรวจสอบว่าคำถามเป็นคำถามเฉพาะเจาะจงหรือไม่
+    # ถ้ามีคำเฉพาะเจาะจง (เช่น ดาวเคราะห์, มุมสัมพันธ์, สีมงคล) ห้ามเปลี่ยนคำถาม
+    specific_keywords = [
+        'ดาว', 'มฤตยู', 'พฤหัส', 'เสาร์', 'อังคาร', 'ศุกร์', 'พุธ', 'อาทิตย์', 'จันทร์',
+        'มุม', 'เล็ง', 'กุม', 'โยค', 'ตรีโกณ', 
+        'อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัส', 'ศุกร์', 'เสาร์', 'มฤตยู', 'เนปจูน', 'พลูโต', 'ราหู', 'เกตุ', 'แบคคัส',
+        'สีมงคล', 'สี', 'เครื่องแบบ', 'ชุด', 'accessories', 'ผลกระทบ', 'ลักษณะการทำงาน',
+        'พาหนะ', 'การเปลี่ยนแปลง', 'ควรทำอย่างไร',
+        'พื้นดวง', 'สัตว์', 'เลี้ยง', 'ห้าม', 'กาลกิณี', 'โฉลก', 'มงคล', 'ดี', 'เสีย', 'เหมาะ',
+        'การงาน', 'งาน', 'อาชีพ', 'การเงิน', 'เงิน', 'โชคลาภ', 'ลงทุน', 'ความรัก', 'รัก', 'คู่', 'แฟน',
+        'สุขภาพ', 'โรค', 'เจ็บป่วย', 'นิสัย', 'บุคลิก'
+    ]
+    is_specific_question = any(keyword in question for keyword in specific_keywords)
+    
+    # 🆕 วิเคราะห์ Entities ในคำถามเพื่อใช้ Filter
+    query_entities = extract_astro_entities(question)
+    logger.info(f"[EVAL] 🔍 Entities found in query: {query_entities}")
+
+    
+    # ปรับปรุง query เมื่อมีข้อมูลวันเกิดในคำถาม - ใช้ชื่อราศีแทนวันเกิดเพื่อให้ค้นหาได้ดีขึ้น
+    if astrology_chart and astrology_chart.get('zodiac_sign'):
+        zodiac_sign = astrology_chart['zodiac_sign']
+        has_birth_date_in_question = bool(birth_info_from_question and birth_info_from_question.get('date'))
+        
+        if has_birth_date_in_question:
+            import re
+            clean_question = question
+            # Regex to remove dates like 10/07/1980, 10-07-1980
+            clean_question = re.sub(r'\d{1,2}[./-]\d{1,2}[./-]\d{4}', '', clean_question)
+            # Regex to remove Thai dates e.g. 10 ก.ค. 2523
+            thai_months = "มกราคม|กุมภาพันธ์|มีนาคม|เมษายน|พฤษภาคม|มิถุนายน|กรกฎาคม|สิงหาคม|กันยายน|ตุลาคม|พฤศจิกายน|ธันวาคม|ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\."
+            date_regex = f"\\d{{1,2}}\\s+(?:{thai_months})\\s+\\d{{4}}"
+            clean_question = re.sub(date_regex, '', clean_question, flags=re.IGNORECASE).strip()
+            
+            # ลบวงเล็บเปล่าที่อาจเหลืออยู่ ()
+            clean_question = clean_question.replace("()", "").strip()
+
+            if is_specific_question:
+                 # สำหรับคำถามเฉพาะเจาะจง ให้ใช้คำถามที่ลบวันที่แล้ว + ชื่อราศี
+                 # ถ้ามี keyword เฉพาะ ให้เน้น keyword นั้นด้วย
+                 question = f"ราศี{zodiac_sign} {clean_question}"
+                 logger.info(f"[EVAL] Cleaned specific question: '{question}'")
+            else:
+                 # สำหรับคำถามทั่วไป
+                 if 'ราศีอะไร' in question:
+                    question = f"ราศี{zodiac_sign} ลักษณะนิสัย บุคลิกภาพ การงาน การเงิน ความรัก โหราศาสตร์"
+                 elif 'ทำนายดวง' in question or 'ดวงชะตา' in question or 'ดวงกำเนิด' in question:
+                    question = f"ราศี{zodiac_sign} ลักษณะนิสัย การงาน การเงิน ความรัก โหราศาสตร์"
+                 else:
+                    question = f"ราศี{zodiac_sign} {clean_question} โหราศาสตร์"
+                 logger.info(f"[EVAL] Cleaned general question: '{question}'")
+        
+        elif not is_specific_question:
+             # ไม่มีวันเกิด และเป็นคำถามทั่วไป -> ปรับปรุง query ปกติ
+             question = f"ราศี{zodiac_sign} {question} โหราศาสตร์"
+             
+    elif is_specific_question:
+        logger.info(f"[EVAL] คำถามเฉพาะเจาะจง (ไม่มีวันเกิด) - ใช้คำถามเดิม: '{question}'")
+    
+    # ลองค้นหาจาก MongoDB แบบ Manual Search
+    retrieved_docs = []
+    try:
+        print("[EVAL] 🔍 กำลังค้นหาจาก MongoDB...")
+        
+        # ตรวจสอบการเชื่อมต่อ MongoDB ก่อนทำ retrieval
+        is_ready, verify_message, conn_info = verify_mongodb_connection_for_retrieval()
+        
+        if not is_ready:
+            print(f"[EVAL] ⚠️ MongoDB ไม่พร้อมใช้งานสำหรับ retrieval: {verify_message}")
+            retrieved_docs = []
+        else:
+            # โหลด embedding model
+            import numpy as np
+            
+            # ใช้ CPU เพื่อหลีกเลี่ยงปัญหา MPS device
+            model = SentenceTransformer("minishlab/potion-multilingual-128M", device="cpu")
+            query_embedding = model.encode(question)
+            print(f"[EVAL] ✅ สร้าง query embedding สำเร็จ (ขนาด: {len(query_embedding)} dimensions)")
+            
+            collections_to_search = [
+                "original_text_chunks",
+                "original_image_chunks",
+                "original_table_chunks",
+            ]
+            
+            client = conn_info.get('client')
+            db = conn_info.get('db')
+            
+            if client is None or db is None:
+                print("[EVAL] ⚠️ ไม่สามารถใช้ MongoDB connection ที่ตรวจสอบแล้วได้")
+                retrieved_docs = []
+            else:
+                try:
+                    collections_status = conn_info.get('collections', {})
+                    
+                    # เริ่มทำ retrieval
+                    for collection_name in collections_to_search:
+                        try:
+                            collection_status_item = collections_status.get(collection_name, {})
+                            if not collection_status_item.get('exists'):
+                                continue
+                            
+                            if collection_status_item.get('doc_count', 0) == 0:
+                                continue
+                            
+                            collection = db[collection_name]
+                            docs = list(collection.find({}))
+                            
+                            if docs:
+                                # คำนวณ similarity scores
+                                similarities = []
+                                for doc in docs:
+                                    if 'embeddings' not in doc:
+                                        continue
+                                    
+                                    try:
+                                        doc_embedding = np.array(doc['embeddings'])
+                                        
+                                        if len(doc_embedding) != len(query_embedding):
+                                            continue
+                                        
+                                        similarity = np.dot(query_embedding, doc_embedding) / (
+                                            np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
+                                        )
+                                        similarities.append((similarity, doc))
+                                    except Exception:
+                                        continue
+                                
+                                if len(similarities) == 0:
+                                    continue
+                                
+                                # เรียงตาม similarity score
+                                similarities.sort(key=lambda x: x[0], reverse=True)
+
+                                # ============================
+                                # 🆕 GLOBAL ENTITY-BASED BOOSTING & FILTERING (ZODIAC-BINDING UPGRADE)
+                                # ============================
+                                
+                                # 1. เตรียม Keywords Entity
+                                target_planets = query_entities.get('planets', [])
+                                planet_keywords = []
+                                for p in target_planets:
+                                    planet_keywords.extend(ASTRO_SYSTEM_ENTITIES.get(p, []))
+                                
+                                # ตรวจจับราศีจากคำถามด้วย (เผื่อกรณีไม่มี astrology_chart)
+                                target_zodiac_keys = query_entities.get('zodiacs', [])
+                                zodiac_keywords = []
+                                
+                                # ถ้ามี Chart ให้ใช้ราศีจาก Chart เป็นหลัก
+                                if astrology_chart and astrology_chart.get('zodiac_sign'):
+                                    z_key = astrology_chart['zodiac_sign']
+                                    zodiac_keywords.append(z_key)
+                                    # เพิ่มภาษาอังกฤษ/คำเรียกอื่นถ้าจำเป็น
+                                    for k, v in ASTRO_SYSTEM_ENTITIES.items():
+                                        if z_key in v: # หา key จาก value
+                                             zodiac_keywords.extend(v)
+                                             break
+                                elif target_zodiac_keys:
+                                    # ถ้าไม่มี Chart ใช้จากที่หาได้ในคำถาม
+                                    for z_key in target_zodiac_keys:
+                                        zodiac_keywords.extend(ASTRO_SYSTEM_ENTITIES.get(z_key, []))
+
+                                # 🆕 PREPARE ZODIAC-KEYWORD BINDING DATA (Rescue Logic Data)
+                                found_specific_keywords = [k for k in specific_keywords if k in question]
+                                
+                                scored_docs = []
+                                seen_doc_ids = set()
+                                
+                                # พิจารณา candidate docs จำนวนมากขึ้น (Top 80)
+                                candidate_docs = similarities[:80]
+                                
+                                for sim, doc in candidate_docs:
+                                    if doc.get('_id') in seen_doc_ids:
+                                        continue
+                                    seen_doc_ids.add(doc.get('_id'))
+                                    
+                                    text_lower = doc.get('text', '').lower()
+                                    source_lower = doc.get('source', '').lower()
+                                    final_score = sim
+                                    
+                                    # --- NOISE FILTER ---
+                                    has_noise = any(nk in text_lower or nk in source_lower for nk in NOISE_KEYWORDS)
+                                    has_astro_context = any(k in text_lower for k in ["astrology", "zodiac", "horoscope", "ราศี", "ดวง", "ดาว"])
+                                    if has_noise and not has_astro_context:
+                                        continue 
+
+                                    # --- 1. PLANET BOOST (+0.25) ---
+                                    matches_planet = False
+                                    if planet_keywords:
+                                        matches_planet = any(pk in text_lower for pk in planet_keywords)
+                                        if matches_planet:
+                                            final_score += 0.25
+                                    
+                                    # --- 2. ZODIAC BOOST (+0.15) ---
+                                    matches_zodiac = False
+                                    
+                                    # 🆕 FIX: Include Calculated Zodiac in Filtering
+                                    effective_zodiac_keywords = list(zodiac_keywords)
+                                    if astrology_chart and astrology_chart.get('zodiac_sign'):
+                                        z_sign = astrology_chart['zodiac_sign']
+                                        if z_sign not in effective_zodiac_keywords:
+                                            effective_zodiac_keywords.append(z_sign)
+                                        if astrology_chart.get('zodiac_english'):
+                                            z_eng = astrology_chart['zodiac_english'].lower()
+                                            if z_eng not in effective_zodiac_keywords:
+                                                effective_zodiac_keywords.append(z_eng)
+
+                                    if effective_zodiac_keywords:
+                                        matches_zodiac = any(zk in text_lower for zk in effective_zodiac_keywords)
+                                        
+                                        # 🆕 DOMINANT ZODIAC CHECK
+                                        if matches_zodiac:
+                                            all_zodiacs_to_check = ["เมษ", "พฤษภ", "เมถุน", "มิถุน", "กรกฎ", "สิงห์", "กันย์", 
+                                                                    "ตุล", "พิจิก", "ธนู", "มังกร", "กุมภ์", "มีน",
+                                                                    "aries", "taurus", "gemini", "cancer", "leo", "virgo", 
+                                                                    "libra", "scorpio", "sagittarius", "capricorn", "aquarius", "pisces"]
+                                            target_count = 0
+                                            for zk in effective_zodiac_keywords:
+                                                target_count += text_lower.count(zk)
+                                            max_other_count = 0
+                                            for z in all_zodiacs_to_check:
+                                                is_target_alias = False
+                                                for tk in effective_zodiac_keywords:
+                                                    if z in tk or tk in z:
+                                                        is_target_alias = True
+                                                        break
+                                                if not is_target_alias:
+                                                    c = text_lower.count(z)
+                                                    if c > max_other_count:
+                                                        max_other_count = c
+                                            if max_other_count >= target_count and max_other_count > 0:
+                                                matches_zodiac = False 
+                                        
+                                        if matches_zodiac:
+                                            final_score += 0.15
+                                    
+                                    # --- 3. STRICT FILTERING (SOFT) ---
+                                    if effective_zodiac_keywords and not matches_zodiac:
+                                        check_list = ["ราศี", "เมษ", "พฤษภ", "เมถุน", "มิถุน", "กรกฎ", "สิงห์", "กันย์", "ตุล", "พิจิก", "ธนู", "มังกร", "กุมภ์", "มีน",
+                                                      "aries", "taurus", "gemini", "cancer", "leo", "virgo", "libra", "scorpio", "sagittarius", "capricorn", "aquarius", "pisces"]
+                                        has_any_zodiac = any(z in text_lower for z in check_list)
+                                        if has_any_zodiac:
+                                            final_score -= 0.6
+                                        else:
+                                            if sim < 0.60:
+                                                final_score -= 0.1
+                                    
+                                    scored_docs.append((final_score, doc, matches_planet, matches_zodiac, sim))
+                                    
+                                # เรียงลำดับตามคะแนนใหม่
+                                scored_docs.sort(key=lambda x: x[0], reverse=True)
+
+                                # 🆕 FINAL SCORE THRESHOLD FILTER & ZODIAC-KEYWORD RESCUE
+                                valid_docs_tuples = []
+                                main_threshold = 0.30 
+                                
+                                for item in scored_docs:
+                                    f_score, d_doc, m_planet, m_zodiac, raw_sim = item
+                                    
+                                    if f_score > 0.0:
+                                        is_accepted = False
+                                        if f_score >= main_threshold:
+                                            is_accepted = True
+                                        
+                                        # 🆕 ZODIAC-KEYWORD BINDING RESCUE
+                                        elif not is_accepted and (f_score > 0.15 or raw_sim > 0.15):
+                                            if m_zodiac: # Check 1: Must match target zodiac (Strict)
+                                                if found_specific_keywords: # Check 2: Must match keyword
+                                                    has_keyword_match = any(k in d_doc.get('text', '').lower() for k in found_specific_keywords)
+                                                    if has_keyword_match:
+                                                        is_accepted = True
+                                                        # print(f"[EVAL] 🛡️ RESCUED Document: Zodiac+Keyword Match (Score: {f_score:.3f})")
+
+                                        if is_accepted:
+                                            valid_docs_tuples.append((f_score, d_doc, m_planet, m_zodiac))
+                                
+                                # เลือก Top 15 จากผลลัพธ์ที่ผ่าน Threshold
+                                top_docs_tuples = valid_docs_tuples[:15]
+                                top_docs = [(s, d) for s, d, mp, mz in top_docs_tuples]
+                                
+                                # Fallback logic
+                                if not top_docs:
+                                    print(f"[EVAL] ⚠️ No docs passed final threshold. Fallback to raw similarities.")
+                                    top_docs = [d for d in similarities if d[0] > 0.25][:5]
+                                
+                                # ปรับ Threshold ขั้นต่ำให้ยอมรับเอกสารที่ Rescue มา
+                                similarity_threshold = 0.10 
+                                threshold = similarity_threshold
+                                
+                                for i, (similarity, doc) in enumerate(top_docs):
+                                    source_info = f"[{collection_name}]"
+                                    if 'page' in doc:
+                                        source_info += f" หน้า {doc['page']}"
+                                    if 'chunk_id' in doc:
+                                        source_info += f" Chunk {doc['chunk_id']}"
+                                    if 'type' in doc:
+                                        source_info += f" ({doc['type']})"
+                                    
+                                    text_content = doc.get('text', '')
+                                    
+                                    doc_info = {
+                                        'text': text_content,
+                                        'source': source_info,
+                                        'similarity': similarity,
+                                        'collection': collection_name,
+                                        'doc_id': doc.get('_id'),
+                                        'page': doc.get('page'),
+                                        'chunk_id': doc.get('chunk_id')
+                                    }
+                                    
+                                    if similarity > threshold:
+                                        retrieved_docs.append(doc_info)
+                        except Exception as e:
+                            print(f"[EVAL] ❌ ไม่สามารถค้นหาใน {collection_name} ได้: {e}")
+                            continue
+                    
+                    print(f"[EVAL] ✅ ดึงข้อมูลจาก MongoDB เสร็จสิ้น: พบ {len(retrieved_docs)} เอกสาร")
+                    
+                except Exception as retrieval_error:
+                    print(f"[EVAL] ❌ เกิดข้อผิดพลาดในการทำ retrieval: {retrieval_error}")
+                    retrieved_docs = []
+                finally:
+                    if client:
+                        try:
+                            client.close()
+                            logger.debug("[EVAL] Closed MongoDB connection after retrieval")
+                        except:
+                            pass
+                
+    except Exception as e:
+        print(f"[EVAL] ❌ ไม่สามารถค้นหาจาก MongoDB ได้: {e}")
+        pass
+    
+    # กรองเฉพาะเอกสารที่ผ่าน threshold
+    valid_retrieved_docs = [doc for doc in retrieved_docs if not doc.get('below_threshold', False)]
+    
+    # 🆕 Debug: แสดงจำนวนเอกสารที่กรองแล้ว
+    print(f"\n[EVAL] 🔍 Debug: จำนวนเอกสารทั้งหมด: {len(retrieved_docs)}, เอกสารที่ผ่าน threshold: {len(valid_retrieved_docs)}")
+    if len(retrieved_docs) > 0 and len(valid_retrieved_docs) == 0:
+        print(f"[EVAL] ⚠️ Warning: มีเอกสาร {len(retrieved_docs)} เอกสาร แต่ไม่มีเอกสารที่ผ่าน threshold")
+        print(f"[EVAL]    ตรวจสอบเอกสารที่ 1-5:")
+        for i, doc in enumerate(retrieved_docs[:5], 1):
+            similarity = doc.get('similarity', 'N/A')
+            below_threshold = doc.get('below_threshold', False)
+            print(f"[EVAL]    {i}. Similarity: {similarity}, below_threshold: {below_threshold}")
+        
+    # 🆕 Supplementary Retrieval: ถ้ามีการคำนวณราศีได้ ให้ค้นหาข้อมูลทั่วไปของราศีนั้นมาเสริมด้วย
+    if astrology_chart:
+        print(f"[DEBUG] Astrology Chart keys: {astrology_chart.keys()}")
+        
+    if astrology_chart and astrology_chart.get('zodiac_sign'):
+        zodiac_sign = astrology_chart['zodiac_sign']
+        
+        # Alias map for better retrieval (matching docs with alternate spellings)
+        zodiac_aliases = {
+            "มังกร": "มกร",
+            "ตุล": "ตุลย์",
+            "กันย์": "กันย",
+            "พิจิก": "พฤศจิก", 
+        }
+        alias = zodiac_aliases.get(zodiac_sign, "")
+        search_terms = f"{zodiac_sign} {alias}".strip()
+
+        # Divide into multiple specific queries to ensure we get detailed docs for each aspect
+        # Divide into multiple specific queries to ensure we get detailed docs for each aspect
+        aspect_queries = []
+        
+        if is_specific_question:
+            # Only add queries relevant to the specific keywords found
+            found_keywords = [k for k in specific_keywords if k in question]
+            
+            # Map specific keywords to more descriptive search terms
+            for k in found_keywords:
+                aspect_queries.append(f"{k} {search_terms}")
+                aspect_queries.append(f"อิทธิพล {k} {search_terms}")
+            
+            # Add standard aspects only if explicitly mentioned
+            if any(x in question for x in ["การงาน", "อาชีพ", "ทำงาน"]):
+                aspect_queries.append(f"การงาน อาชีพ {search_terms}")
+            if any(x in question for x in ["การเงิน", "รายได้", "ฐานะ"]):
+                aspect_queries.append(f"การเงิน ฐานะ {search_terms}")
+            if any(x in question for x in ["ความรัก", "คู่ครอง", "แฟน"]):
+                aspect_queries.append(f"ความรัก คู่ครอง {search_terms}")
+            
+            # Fallback if specific keywords didn't generate enough queries
+            if not aspect_queries:
+                aspect_queries.append(f"{question} {search_terms}")
+                
+            print(f"[EVAL] 🎯 Search strategy: Specific Mode (Queries: {aspect_queries})")
+        else:
+            # Default generic aspects
+            aspect_queries = [
+                f"ลักษณะนิสัย {search_terms}",
+                f"การงาน อาชีพ {search_terms}",
+                f"การเงิน ฐานะ {search_terms}",
+                f"ความรัก คู่ครอง {search_terms}"
+            ]
+            print(f"[EVAL] 🌐 Search strategy: General Mode")
+        
+        print(f"\n[EVAL] 🔍 ค้นหาข้อมูลเสริมสำหรับราศี: {zodiac_sign} (Aliases: {search_terms})")
+        
+        # Manual Connection to ensure we get the right DB
+        from pymongo import MongoClient
+        from dotenv import load_dotenv
+        load_dotenv()
+        
+        mongo_uri = os.getenv("MONGO_URL") or os.getenv("MONGODB_URI")
+        db_name = os.getenv("MONGODB_DB_NAME") or "astrobot_original"
+        coll_name = os.getenv("MONGODB_COLLECTION_NAME") or "original_text_chunks"
+        
+        try:
+            debug_client = MongoClient(mongo_uri)
+            debug_db = debug_client[db_name]
+            collection = debug_db[coll_name]
+            doc_count = collection.count_documents({})
+            print(f"[DEBUG] CONNECTED TO: DB={db_name}, COLL={coll_name}, DOCS={doc_count}")
+            
+        except Exception as e:
+            print(f"[DEBUG] Connection Failed: {e}")
+            collection = None
+
+        if collection is not None:
+            # Get all docs once
+            # Actually, iterate queries and find best matches for each
+            
+            zodiac_retrieved = []
+            seen_texts = set()
+
+            # Pull all docs once
+            all_docs = list(collection.find(
+                {},
+                {"text": 1, "embeddings": 1, "source": 1, "_id": 0}
+            ))
+
+            print(f"[DEBUG] Total docs fetched for supplementary: {len(all_docs)}")
+            for query in aspect_queries:
+                q_embed = model.encode(query)
+                
+                # Find docs for this aspect
+                candidates = []
+                
+                for doc in all_docs:
+                    if 'embeddings' in doc and doc['embeddings']:
+                        doc_emb = np.array(doc['embeddings'])
+                        sim = cosine_similarity([q_embed], [doc_emb])[0][0]
+                        
+                        text_lower = doc.get('text', '').lower()
+                        source_lower = doc.get('source', '').lower()
+
+                        # ============================
+                        # 🆕 ENTITY-BASED FILTERING (Supplementary)
+                        # ============================
+                        
+                        # --- NOISE FILTER ---
+                        has_noise = any(nk in text_lower or nk in source_lower for nk in NOISE_KEYWORDS)
+                        has_astro_context = any(k in text_lower for k in ["astrology", "zodiac", "horoscope", "ราศี", "ดวง", "ดาว"])
+                        if has_noise and not has_astro_context:
+                            continue
+
+                        # --- STRICT WRONG ZODIAC FILTER (Supplementary) ---
+                        # ป้องกันเอกสารข้ามราศีหลุดเข้ามา (เช่น ถาม Taurus แต่ได้ Aries ที่ Sim สูง)
+                        if astrology_chart and astrology_chart.get('zodiac_sign'):
+                            target_zodiac = astrology_chart['zodiac_sign'] # e.g. "พฤษภ"
+                            # ตรวจสอบว่ามีชื่อราศีอื่นที่ไม่ใช่ target หรือไม่
+                            # ใช้ Keyword ชุดเดียวกับ Main Search
+                            zodiac_list = ["ราศีเมษ", "ราศีพฤษภ", "ราศีเมถุน", "ราศีกรกฎ", "ราศีสิงห์", "ราศีกันย์", 
+                                          "ราศีตุล", "ราศีพิจิก", "ราศีธนู", "ราศีมังกร", "ราศีกุมภ์", "ราศีมีน",
+                                          "aries", "taurus", "gemini", "cancer", "leo", "virgo", 
+                                          "libra", "scorpio", "sagittarius", "capricorn", "aquarius", "pisces"]
+                            
+                            # ถ้าเอกสารมีคำว่า "ราศี" หรือชื่อ Eng
+                            matches_target = target_zodiac in text_lower or (astrology_chart.get('zodiac_english', '').lower() in text_lower)
+                            
+                            found_any_zodiac = False
+                            is_wrong_zodiac = False
+                            
+                            for z in zodiac_list:
+                                if z in text_lower:
+                                    found_any_zodiac = True
+                                    # เช็คว่าเป็นราศีเป้าหมายหรือไม่
+                                    # ต้องระวัง Substring matching แต่เบื้องต้นเอาแบบ Simple ก่อน
+                                    # ถ้า z ไม่ใช่ alias ของ target -> ผิดราศี
+                                    if target_zodiac not in z and astrology_chart.get('zodiac_english', '').lower() not in z:
+                                        # Double check เพื่อความชัวร์ (เช่น "ราศีพฤษภ" มีคำว่า "ราศี")
+                                        # แต่รายการข้างบนใส่ชื่อเต็มแล้ว
+                                        if z != "ราศี": # ตัดคำทั่วไปออก (รายการข้างบนไม่มีคำว่า "ราศี" เฉยๆ)
+                                            is_wrong_zodiac = True
+                                            break
+                            
+                            # ถ้าเจอราศีอื่น และ ไม่เจอราศีเป้าหมาย -> ทิ้งเลย
+                            if is_wrong_zodiac and not matches_target:
+                                # debug_print = f"[FILTERED OUT] Diff Zodiac: {text_lower[:30]}..."
+                                continue
+
+                        # --- PLANET FILTER ---
+                        required_planet_keywords = []
+                        for p_key in query_entities['planets']:
+                            required_planet_keywords.extend(ASTRO_SYSTEM_ENTITIES[p_key])
+                            
+                        if required_planet_keywords:
+                            found_planet = any(pk in text_lower for pk in required_planet_keywords)
+                            if not found_planet:
+                                # อนุโลมให้ถ้า similarity สูงมาก (เผื่อบริบทแฝง)
+                                if sim < 0.8: 
+                                    continue
+
+                        # Logic to accept documents:
+                        # 1. Similarity > 0.25 (Relaxed from 0.35)
+                        # 2. Similarity > 0.15 AND contains zodiac keyword (Exception for relevant context)
+                        is_high_sim = sim > 0.25
+                        
+                        # Check for whitelist keywords (Zodiac names AND Planets)
+                        is_whitelisted = False
+                        if astrology_chart and astrology_chart.get('zodiac_sign'):
+                            z_target = astrology_chart['zodiac_sign']
+                            if z_target in doc.get('text', ''):
+                                is_whitelisted = True
+                        
+                        # Check for planetary keywords in both Query and Doc
+                        planet_keywords = ["มฤตยู", "พฤหัส", "เสาร์", "อังคาร", "ศุกร์", "พุธ", "อาทิตย์", "จันทร์", "ราหู", "เกตุ", "พลูโต", "เนปจูน", "แบคคัส"]
+                        for planet in planet_keywords:
+                            if planet in query and planet in doc.get('text', ''):
+                                is_whitelisted = True
+
+                        # 🆕 Strict Supplementary Filter: ใช้เกณฑ์ที่ผ่อนปรนขึ้น (0.30)
+                        if is_high_sim or (is_whitelisted and sim > 0.30):
+                            doc_copy = doc.copy()
+                            doc_copy['similarity'] = float(sim)
+                            candidates.append(doc_copy)
+                
+                # Sort candidates by similarity
+                candidates.sort(key=lambda x: x['similarity'], reverse=True)
+                
+                # Take Top 10 to ensure we don't miss relevant docs like the Pottery one
+                top_k_aspect = candidates[:10]
+                
+                for d in top_k_aspect:
+                    if d.get('text') not in seen_texts:
+                        seen_texts.add(d.get('text'))
+                        d['is_supplementary'] = True
+                        zodiac_retrieved.append(d)
+                        print(f"[EVAL]       + เจอข้อมูลด้าน '{query.split()[0]}': {d.get('text')[:40]}... (Sim: {d['similarity']:.3f})")
+
+            # Merge into valid_retrieved_docs
+            existing_texts = set(d.get('text', '') for d in retrieved_docs)
+            for zd in zodiac_retrieved:
+                if zd.get('text', '') not in existing_texts:
+                    retrieved_docs.append(zd)
+
+    # 🆕 ถ้ามีเอกสารแต่ไม่มีเอกสารที่ผ่าน threshold ให้ใช้เอกสารที่มี similarity สูงสุดแทน
+    if len(retrieved_docs) > 0:
+        # 🆕 ยกเลิก VIP Sorting: เรียงตาม Similarity ล้วนๆ ไม่สนว่าเป็น Supplementary หรือไม่
+        # เพื่อให้เอกสารที่คะแนนความเหมือนสูงสุด (ตรงที่สุด) ได้รับเลือก
+        sorted_docs = sorted(retrieved_docs, key=lambda x: x.get('similarity', 0), reverse=True)
+        
+        # 🆕 Strict Limit: จำกัดแค่ 7 รายการ (ตาม User Requested)
+        top_docs_fallback = sorted_docs[:7]
+        print(f"[EVAL]    🔄 ใช้เอกสาร {len(top_docs_fallback)} รายการ (จัดลำดับความสำคัญ Supplementary ก่อน)")
+        valid_retrieved_docs = top_docs_fallback
+        # ลบ flag below_threshold เพื่อให้ระบบใช้เอกสารเหล่านี้
+        for doc in valid_retrieved_docs:
+            doc.pop('below_threshold', None)
+    
+    # ตรวจสอบว่ามีเอกสารจาก MongoDB หรือไม่
+    if not valid_retrieved_docs or len(valid_retrieved_docs) == 0:
+        print("\n[EVAL] ⚠️ ไม่พบข้อมูลจาก MongoDB")
+        answer = "ขออภัยค่ะ ไม่พบข้อมูลที่เกี่ยวข้องในฐานข้อมูลสำหรับคำถามนี้ กรุณาลองใช้คำถามที่เกี่ยวข้องกับโหราศาสตร์ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์' ค่ะ"
+        answer = "ขออภัยค่ะ ไม่พบข้อมูลที่เกี่ยวข้องในฐานข้อมูลสำหรับคำถามนี้ กรุณาลองใช้คำถามที่เกี่ยวข้องกับโหราศาสตร์ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์' ค่ะ"
+        return answer, []
+    
+    # ใช้ GPT กับข้อมูลจาก MongoDB (RAG system)
+    try:
+        from openai import OpenAI
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key or openai_key == "your-openai-api-key-here":
+            return "ขออภัยค่ะ ตอนนี้ระบบยังไม่พร้อมใช้งาน AI ภายนอก แต่คุณสามารถถามเกี่ยวกับราศีได้ตามปกติ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์'", []
+        client = OpenAI(api_key=openai_key)
+        
+        # สร้าง context จากข้อมูลที่ดึงมา
+        context_info = ""
+        final_used_docs = []
+        if valid_retrieved_docs:
+            # 🆕 ยกเลิก VIP Sorting: เรียงตาม Similarity ล้วนๆ
+            sorted_docs = sorted(valid_retrieved_docs,
+                               key=lambda x: x.get('similarity', 0),
+                               reverse=True)
+            high_similarity_docs = sorted_docs[:7]  # ใช้ 7 อันดับแรก
+            
+            # 🆕 ถ้ามีการกรองตามราศี ให้เพิ่มเอกสารที่เกี่ยวข้องกับราศีนั้นๆ
+            if astrology_chart and astrology_chart.get('zodiac_sign'):
+                target_zodiac = astrology_chart['zodiac_sign']
+                zodiac_related_docs = []
+                for doc in valid_retrieved_docs:
+                    if isinstance(doc, dict):
+                        text_content = doc.get('text', '')
+                        similarity = doc.get('similarity', 0)
+                        if text_content:
+                            zodiac_patterns = [
+                                f"ราศี{target_zodiac}",
+                                f"คนราศี{target_zodiac}",
+                                f"ชาวราศี{target_zodiac}",
+                                f"ราศี {target_zodiac}",
+                                f"คนราศี {target_zodiac}",
+                                f"ชาวราศี {target_zodiac}",
+                                target_zodiac
+                            ]
+                            contains_zodiac = any(pattern in text_content for pattern in zodiac_patterns)
+                            # ลด threshold สำหรับ zodiac related docs เพื่อให้ติดง่ายขึ้น
+                            if contains_zodiac and similarity > 0.20:
+                                if doc not in high_similarity_docs:
+                                    zodiac_related_docs.append(doc)
+                
+                if zodiac_related_docs:
+                    high_similarity_docs.extend(zodiac_related_docs)
+                    # Resort by Similarity ONLY (No VIP)
+                    high_similarity_docs.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+                    # ใช้เฉพาะ 7 อันดับแรก
+                    high_similarity_docs = high_similarity_docs[:7]
+            
+            if high_similarity_docs:
+                final_used_docs = high_similarity_docs
+                context_info = "\n\n**ข้อมูลที่เกี่ยวข้องจากฐานข้อมูลต้นฉบับ (ค้นหาด้วย cosine similarity จาก embeddings - แสดงเอกสารที่มี Similarity สูงสุด):**\n"
+                for i, doc in enumerate(high_similarity_docs):
+                    if isinstance(doc, dict):
+                        similarity_score = doc.get('similarity', 0)
+                        content_to_use = doc.get('text', '')
+                        source_info = doc.get('source', 'Unknown')
+                        
+                        context_info += f"{i+1}. [Similarity: {similarity_score:.4f}] {source_info}\n"
+                        context_info += f"   Context: {content_to_use}\n\n"
+            else:
+                # 🆕 Fallback: ใช้เอกสารที่มี similarity สูงสุด 3 อันดับแรก (ลดจาก 5)
+                sorted_docs = sorted(valid_retrieved_docs,
+                                   key=lambda x: x.get('similarity', 0) if isinstance(x, dict) else 0,
+                                   reverse=True)
+                top_docs = sorted_docs[:3]
+                if top_docs:
+                    final_used_docs = top_docs
+                    context_info = "\n\n**ข้อมูลที่เกี่ยวข้องจากฐานข้อมูลต้นฉบับ (ค้นหาด้วย cosine similarity จาก embeddings - แสดงเอกสารที่มี Similarity สูงสุด):**\n"
+                    for i, doc in enumerate(top_docs):
+                        if isinstance(doc, dict):
+                            similarity_score = doc.get('similarity', 0)
+                            content_to_use = doc.get('text', '')
+                            source_info = doc.get('source', 'Unknown')
+                            
+                            context_info += f"{i+1}. [Similarity: {similarity_score:.4f}] {source_info}\n"
+                            context_info += f"   Context: {content_to_use}\n\n"
+        
+        # สร้างข้อมูลดวงชะตาเพิ่มเติม
+        chart_info = ""
+        if astrology_chart:
+            location_info = ""
+            if 'birth_location_name' in astrology_chart:
+                location_info = f"สถานที่เกิด: {astrology_chart['birth_location_name']}\n"
+            elif 'birth_location' in astrology_chart:
+                location_info = f"สถานที่เกิด: กรุงเทพฯ\n"
+            
+            chart_info = f"""
+**ข้อมูลดวงชะตาจากวันเกิดและเวลาเกิด:**
+ราศีเกิด: {astrology_chart['zodiac_sign']} ({astrology_chart['zodiac_english']})
+ธาตุ: {astrology_chart['zodiac_element']}
+วันเกิด: {astrology_chart['birth_date']}
+เวลาเกิด: {astrology_chart['birth_time'] if astrology_chart['birth_time'] else 'ไม่ระบุ'}{location_info}อายุ: {astrology_chart['age']} ปี
+"""
+            
+            if 'ascendant' in astrology_chart:
+                ascendant = astrology_chart['ascendant']
+                chart_info += f"""
+**ข้อมูลลัคณา (ราศีประจำลัคนา):**
+ลัคณา: ราศี{ascendant['sign']} {ascendant['degree']:.1f}° ({ascendant['element']})
+"""
+
+            if 'planets' in astrology_chart:
+                chart_info += "\n**ตำแหน่งดาวเคราะห์ (Planetary Positions):**\n"
+                for planet_name, planet_data in astrology_chart['planets'].items():
+                    # Use Thai names if available, falling back to English
+                    p_name = planet_data.get('name_th', planet_name)
+                    sign = planet_data.get('sign_th', planet_data.get('sign', 'Unknown'))
+                    degree = planet_data.get('degree', 0.0)
+                    retro = " (Retrograde)" if planet_data.get('retrograde') else ""
+                    chart_info += f"- {p_name}: ราศี{sign} {degree:.1f}°{retro}\n"
+
+            if 'aspects' in astrology_chart:
+                chart_info += "\n**มุมสัมพันธ์ของดาว (Planetary Aspects):**\n"
+                for aspect in astrology_chart['aspects']:
+                    p1 = aspect.get('p1_th', aspect.get('p1'))
+                    p2 = aspect.get('p2_th', aspect.get('p2'))
+                    type_ = aspect.get('type_th', aspect.get('type'))
+                    orb = aspect.get('orb', 0.0)
+                    chart_info += f"- ดาว{p1} {type_} ดาว{p2} (Orb: {orb:.1f}°)\n"
+        
+        # สร้าง prompt สำหรับ GPT (ใช้ prompt เดียวกับ ask_question_to_rag แต่ไม่มี user context)
+        birth_info = ""  # ไม่มี user context สำหรับการประเมิน
+        
+        # กำหนด focus instruction ตาม question intent
+        focus_instruction = ""
+        if question_intent["specific_topic"] == "personality":
+            focus_instruction = """
+**คำสั่งสำคัญ: ตอบเฉพาะเรื่องลักษณะนิสัยและบุคลิกภาพเท่านั้น**
+"""
+        elif question_intent["specific_topic"] == "love":
+            focus_instruction = """
+**คำสั่งสำคัญ: ตอบเฉพาะเรื่องความรักและความสัมพันธ์เท่านั้น**
+"""
+        elif question_intent["specific_topic"] == "career":
+            focus_instruction = """
+**คำสั่งสำคัญ: ตอบเฉพาะเรื่องอาชีพและการงานเท่านั้น**
+"""
+        elif question_intent["specific_topic"] == "finance":
+            focus_instruction = """
+**คำสั่งสำคัญ: ตอบเฉพาะเรื่องการเงินและการลงทุนเท่านั้น**
+"""
+        else:
+            # 🆕 แก้ไข: ถ้ามีวันเกิด แต่เป็นคำถามเฉพาะเจาะจง ไม่ต้องบังคับตอบครบ 4 ด้าน
+            if birth_info_from_question and birth_info_from_question.get('date'):
+                # ตรวจสอบว่า Intent เป็น General หรือไม่
+                is_actually_general = question_intent.get('is_general') or (not question_intent.get('specific_topic') and not is_specific_question)
+                
+                if is_actually_general and not is_specific_question:
+                    focus_instruction = """
+**⚠️ คำสั่งสำคัญ: เมื่อคำถามมีวันเดือนปีเกิด ต้องตอบครบทั้ง 4 ด้านเสมอ (ห้ามขาดด้านใดด้านหนึ่ง):**
+1. **ด้านการงาน (บังคับ)**
+2. **ด้านการเงิน (บังคับ)**
+3. **ด้านความรัก (บังคับ)**
+4. **สีมงคล (บังคับ)**
+"""
+                elif is_specific_question:
+                     focus_instruction = f"""
+**คำสั่งสำคัญ: ตอบคำถามโดยใช้ข้อมูลจากบริบทที่ให้มาเท่านั้น**
+- ตอบให้ตรงกับประเด็นที่ถาม (เช่น ถ้าถามเรื่องสัตว์เลี้ยง ให้ตอบเรื่องสัตว์เลี้ยง)
+- **ห้าม** ตอบเรื่องอื่นที่ไม่เกี่ยวข้อง (เช่น การเงิน ความรัก) เว้นแต่จะถูกถาม
+- ถ้าข้อมูลในบริบทระบุว่าเป็น 'ของต้องห้าม' หรือ 'กาลกิณี' ต้องแจ้งเตือนผู้ใช้ทันที
+"""
+
+        # สร้าง astrology_prompt (ใช้ prompt เดียวกับ ask_question_to_rag แต่ไม่มี user context)
+        if astrology_chart:
+            astrology_prompt = f"""คุณเป็นโหราจารย์ดิจิทัลผู้เชี่ยวชาญด้านโหราศาสตร์ตะวันตก (Western Astrology)
+
+**⚠️ ข้อกำหนดสำคัญสำหรับ RAG System:**
+- **ใช้ข้อมูลจากฐานข้อมูล (MongoDB) เป็นหลัก**
+- **อนุญาตให้ใช้ความรู้ทั่วไปทางโหราศาสตร์เพื่อเชื่อมโยงข้อมูลในบริบทกับคำถามได้** (แต่ห้ามยกเมฆข้อมูลใหม่ที่ขัดแย้งกับบริบท)
+- **ถ้ามีข้อมูลในบริบทที่ตรงกับราศีของวันเกิด ให้ตอบได้ทันที**
+- **กฎเหล็กเรื่องของต้องห้าม:** หากข้อความที่ค้นคืนมา (retrieved text) ระบุว่าเป็น 'ของต้องห้าม', 'สิ่งอัปมงคล', หรือ 'กาลกิณี' คุณ **ต้อง** ระบุว่าเป็นของต้องห้าม และ **ห้าม** แนะนำสิ่งนั้นให้ผู้ใช้เด็ดขาด (แม้ว่าวันเกิดอาจจะดูเหมือนส่งเสริมก็ตาม ให้ยึดตามข้อห้ามในบริบทเป็นที่สุด)
+
+**ข้อกำหนดการเรียกชื่อ:**
+- ใช้ชื่อราศีแบบไทย (เช่น มังกร, มกร)
+- สำหรับราศีที่ 12 ใช้ "ราศีมีน"
+- ใช้คำว่า "ลัคณา" แทน "Ascendant"
+
+{focus_instruction}
+
+**ข้อมูลสำหรับการวิเคราะห์:**
+{birth_info}
+{chart_info}
+{context_info}
+
+**คำถามของผู้ใช้:** {question}
+
+**วิธีการตอบคำถาม:**
+1. ใช้ข้อมูลจากส่วน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" มาวิเคราะห์และตอบ
+2. **ถ้าเจอบทความเกี่ยวกับราศีที่ตรงกับวันเกิด (เช่น ราศีมกร/มังกร) ให้สรุปข้อมูลนั้นมาตอบได้เลย** ไม่ต้องปฏิเสธว่าไม่เจอวันที่เจาะจง
+3. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
+4. คำลงท้ายต้องใช้ "ค่ะ" เท่านั้น
+"""
+        else:
+            astrology_prompt = f"""คุณเป็นโหราจารย์ดิจิทัลผู้เชี่ยวชาญด้านโหราศาสตร์ตะวันตก (Western Astrology)
+
+**⚠️ ข้อกำหนดสำคัญสำหรับ RAG System:**
+- **ใช้ข้อมูลจากฐานข้อมูล (MongoDB) เป็นหลัก**
+- **อนุญาตให้ใช้ความรู้ทั่วไปทางโหราศาสตร์เพื่อเชื่อมโยงข้อมูลในบริบทกับคำถามได้** (แต่ห้ามยกเมฆข้อมูลใหม่ที่ขัดแย้งกับบริบท)
+- **ถ้ามีข้อมูลในบริบทที่ตรงกับราศีของวันเกิด ให้ตอบได้ทันที**
+
+**ข้อกำหนดการเรียกชื่อ:**
+- ใช้ชื่อราศีแบบไทย (เช่น มังกร, มกร)
+- สำหรับราศีที่ 12 ใช้ "ราศีมีน"
+- ใช้คำว่า "ลัคณา" แทน "Ascendant"
+
+{focus_instruction}
+
+**ข้อมูลสำหรับการวิเคราะห์:**
+{birth_info}
+{chart_info}
+{context_info}
+
+**คำถามของผู้ใช้:** {question}
+
+**วิธีการตอบคำถาม:**
+1. ใช้ข้อมูลจากส่วน "ข้อมูลที่เกี่ยวข้องจากฐานข้อมูล" มาวิเคราะห์และตอบ
+2. **ถ้าเจอบทความเกี่ยวกับราศีที่ตรงกับวันเกิด (เช่น ราศีมกร/มังกร) ให้สรุปข้อมูลนั้นมาตอบได้เลย** ไม่ต้องปฏิเสธว่าไม่เจอวันที่เจาะจง
+3. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
+4. คำลงท้ายต้องใช้ "ค่ะ" เท่านั้น
+"""
+        
+        # สร้าง system prompt
+        if astrology_chart:
+            system_prompt = """คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด 
+ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย ใช้ชื่อราศีแบบไทย (อนุญาตให้ใช้ มกร/มังกร ได้)"""
+        else:
+            system_prompt = """คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด 
+ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย ใช้ชื่อราศีแบบไทย (อนุญาตให้ใช้ มกร/มังกร ได้)"""
+        
+        # ใช้ชื่อโมเดลจาก ENV
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        
+        response = client.chat.completions.create(
+            model=openai_model,
+            messages=[
+                {
+                    "role": "system", 
+                    "content": system_prompt
+                },
+                {"role": "user", "content": astrology_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+        answer = response.choices[0].message.content.strip()
+        print(f"[EVAL] ✔ ได้รับค่าตอบจาก GPT (ความยาว: {len(answer)} ตัวอักษร)")
+        
+    except Exception as gpt_error:
+        # Fallback: ตอบแบบพื้นฐานโดยไม่ใช้ LLM
+        try:
+            if astrology_chart and astrology_chart.get('zodiac_sign'):
+                zodiac = astrology_chart['zodiac_sign']
+                birth_date_text = astrology_chart.get('birth_date', '')
+                answer = f"วันเกิด: {birth_date_text}\nราศีของคุณคือ ราศี{zodiac}"
+            else:
+                from .birth_date_parser import BirthDateParser
+                parser = BirthDateParser()
+                info = parser.extract_birth_info(question)
+                if info and info.get('date'):
+                    # Use keyword arguments to ensure strict safety
+                    chart = parser.generate_birth_chart_info(
+                        birth_date=info['date'], 
+                        birth_time=info.get('time'), 
+                        latitude=info.get('latitude', 13.7563), 
+                        longitude=info.get('longitude', 100.5018)
+                    )
+                    if chart and chart.get('zodiac_sign'):
+                        answer = f"วันเกิด: {info['date']}\nราศีของคุณคือ ราศี{chart['zodiac_sign']}"
+                    else:
+                        answer = "ขออภัยค่ะ ไม่สามารถคำนวณราศีได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง"
+                else:
+                    answer = "คุณสามารถบอกวันเกิดในรูปแบบ 07/09/2003 เพื่อให้บอกว่าราศีอะไรได้ค่ะ"
+        except Exception as e:
+            print(f"[ERROR] Error in ask_question_to_rag_for_evaluation: {e}")
+            answer = "ขออภัยค่ะ เกิดปัญหาในการประมวลผล กรุณาลองใหม่อีกครั้ง"
+    
+    # ⚠️ ไม่มีการบันทึกข้อมูลลงฐานข้อมูลสำหรับการประเมิน
+    # ⚠️ ไม่มีการแสดงรายงาน terminal (เพื่อลด output)
+    
+    # Extract text content for Ragas evaluation
+    retrieved_contexts_text = [d.get('text', '') for d in (final_used_docs if 'final_used_docs' in locals() else [])]
+    
+    # 🆕 Inject chart_info into contexts for Ragas Faithfulness check
+    # Ragas needs to see the "source of truth" for the calculated data
+    if chart_info:
+        retrieved_contexts_text.append(f"*** Calculated Astrology Data ***\n{chart_info}")
+        print(f"[EVAL] ➕ Injected chart_info into Ragas context ({len(chart_info)} chars)")
+
+    # Debug: Print ALL retrieved contexts
+    print(f"\n[EVAL] Final Retrieved Contexts ({len(retrieved_contexts_text)} docs):")
+    for idx, txt in enumerate(retrieved_contexts_text):
+        snippet = txt[:100].replace('\n', ' ')
+        is_pottery = "เครื่องปั้นดินเผา" in txt
+        marker = "!!! POTTERY !!!" if is_pottery else ""
+        print(f"[EVAL]   [{idx+1}] {snippet}... {marker}")
+        if is_pottery:
+            print(f"[SUCCESS] Found Pottery Doc at Rank {idx+1}")
+            
+    return answer, retrieved_contexts_text

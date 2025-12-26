@@ -470,6 +470,70 @@ class BirthDateParser:
         
         return None
 
+    def calculate_chinese_zodiac(self, year: int) -> dict:
+        """
+        คำนวณปีนักษัตรจากปี ค.ศ.
+        
+        Args:
+            year (int): ปี ค.ศ.
+            
+        Returns:
+            dict: ข้อมูลปีนักษัตร {'sign': 'ชื่อปีนักษัตร', 'english_name': 'ชื่ออังกฤษ', 'element': 'ธาตุ (ตามปี)'}
+        """
+        animals = [
+            {'name': 'ชวด', 'eng': 'Rat', 'element': 'Water'},
+            {'name': 'ฉลู', 'eng': 'Ox', 'element': 'Earth'},
+            {'name': 'ขาล', 'eng': 'Tiger', 'element': 'Wood'},
+            {'name': 'เถาะ', 'eng': 'Rabbit', 'element': 'Wood'},
+            {'name': 'มะโรง', 'eng': 'Dragon', 'element': 'Earth'},
+            {'name': 'มะเส็ง', 'eng': 'Snake', 'element': 'Fire'},
+            {'name': 'มะเมีย', 'eng': 'Horse', 'element': 'Fire'},
+            {'name': 'มะแม', 'eng': 'Goat', 'element': 'Earth'},
+            {'name': 'วอก', 'eng': 'Monkey', 'element': 'Metal'},
+            {'name': 'ระกา', 'eng': 'Rooster', 'element': 'Metal'},
+            {'name': 'จอ', 'eng': 'Dog', 'element': 'Earth'},
+            {'name': 'กุน', 'eng': 'Pig', 'element': 'Water'}
+        ]
+        
+        index = (year - 4) % 12
+        animal = animals[index]
+        
+        return {
+            'sign': f"ปี{animal['name']}",
+            'animal_name': animal['name'],
+            'english_name': animal['eng'],
+            'element': animal['element']
+        }
+
+    def get_lucky_colors(self, zodiac_sign: str) -> dict:
+        """
+        ระบุสีมงคลตามราศี (Western Astrology)
+        
+        Args:
+            zodiac_sign (str): ชื่อราศี (ภาษาไทย)
+            
+        Returns:
+            dict: ข้อมูลสีมงคล {'primary': 'สีหลัก', 'secondary': 'สีรอง', 'avoid': 'สีที่ควรเลี่ยง'}
+        """
+        colors_map = {
+            'เมษ': {'primary': 'แดง', 'secondary': 'ขาว, ชมพู', 'avoid': 'ดำ'},
+            'พฤษภ': {'primary': 'เขียว', 'secondary': 'ชมพู, ฟ้า', 'avoid': 'แดง'},
+            'เมถุน': {'primary': 'เหลือง', 'secondary': 'เขียว, ส้ม', 'avoid': 'เทา'},
+            'กรกฎ': {'primary': 'ขาว', 'secondary': 'เงิน, ครีม', 'avoid': 'ดำ'},
+            'สิงห์': {'primary': 'ทอง', 'secondary': 'ส้ม, แดง', 'avoid': 'ฟ้า'},
+            'กันย์': {'primary': 'เขียว', 'secondary': 'น้ำตาล, เทา', 'avoid': 'แดง'},
+            'ตุล': {'primary': 'ฟ้า', 'secondary': 'ชมพู, ขาว', 'avoid': 'ส้ม'},
+            'พิจิก': {'primary': 'แดงเลือดหมู', 'secondary': 'ดำ, ม่วง', 'avoid': 'ฟ้า'},
+            'ธนู': {'primary': 'ม่วง', 'secondary': 'น้ำเงิน, เหลือง', 'avoid': 'เขียว'},
+            'มังกร': {'primary': 'น้ำตาล', 'secondary': 'เทา, ดำ', 'avoid': 'เหลือง'},
+            'กุมภ์': {'primary': 'ฟ้า', 'secondary': 'ม่วง, เงิน', 'avoid': 'ทอง'},
+            'มีน': {'primary': 'เขียวทะเล', 'secondary': 'ม่วง, ฟ้า', 'avoid': 'แดง'}
+        }
+        
+        # Clean zodiac name just in case
+        clean_sign = zodiac_sign.replace('ราศี', '').strip()
+        return colors_map.get(clean_sign, {'primary': 'ไม่ระบุ', 'secondary': '', 'avoid': ''})
+
     def calculate_zodiac_sign(self, day: int, month: int) -> dict:
         """
         คำนวณราศีจากวันและเดือน (Western Astrology)
@@ -578,6 +642,8 @@ class BirthDateParser:
         """
         if not birth_date:
             return None
+
+        logger.info(f"[DEBUG] generate_birth_chart_info called with: date={birth_date}, time={birth_time}, lat={latitude}, lon={longitude}")
         
         try:
             # แปลงวันเกิด
@@ -605,6 +671,12 @@ class BirthDateParser:
             # คำนวณอายุ
             age = datetime.now().year - year
             
+            # คำนวณปีนักษัตร (Chinese Zodiac)
+            chinese_zodiac_info = self.calculate_chinese_zodiac(year)
+            
+            # คำนวณสีมงคล
+            lucky_colors = self.get_lucky_colors(zodiac_info['sign'])
+            
             # สร้างข้อมูลดวงชะตา
             chart_info = {
                 'birth_date': birth_date,
@@ -615,6 +687,10 @@ class BirthDateParser:
                 'zodiac_quality': zodiac_info['quality'],
                 'zodiac_english': zodiac_info['english_name'],
                 'zodiac_description': zodiac_info.get('description', ''),
+                'chinese_zodiac': chinese_zodiac_info['sign'],
+                'chinese_zodiac_animal': chinese_zodiac_info['animal_name'],
+                'chinese_zodiac_english': chinese_zodiac_info['english_name'],
+                'lucky_colors': lucky_colors,
                 'birth_datetime': birth_datetime,
                 'birth_location': {
                     'latitude': latitude,
@@ -894,8 +970,16 @@ def generate_detailed_astrology_reading(message: str, latitude: float = None, lo
     if longitude is None:
         longitude = birth_info.get('longitude', 100.5018)
     
+    logger.info(f"[DEBUG] generate_detailed_astrology_reading: Lat={latitude}, Lon={longitude}")
+    
     # สร้างข้อมูลดวงชะตา
-    chart_info = parser.generate_birth_chart_info(birth_info['date'], birth_info['time'], latitude, longitude)
+    # Use keyword explicitly to avoid position errors
+    chart_info = parser.generate_birth_chart_info(
+        birth_date=birth_info['date'], 
+        birth_time=birth_info['time'], 
+        latitude=latitude, 
+        longitude=longitude
+    )
     
     if not chart_info:
         return None
